@@ -37,6 +37,16 @@ from cebra.data.datatypes import Batch
 from cebra.data.datatypes import BatchIndex
 from cebra.data.datatypes import Offset
 
+# Import kirby dataset classes
+try:
+    from kirby.data import Dataset as KirbyDataset
+    from kirby.data import Data as KirbyData
+    KIRBY_AVAILABLE = True
+except ImportError:
+    KIRBY_AVAILABLE = False
+    KirbyDataset = None
+    KirbyData = None
+
 if TYPE_CHECKING:
     from cebra.models import Model
 
@@ -120,6 +130,136 @@ class TensorDataset(cebra_data.SingleSessionDataset):
             # NOTE(stes): Required for standardizing number format on
             # windows machines.
             array = array.long()
+        return array
+
+    @property
+    def input_dimension(self) -> int:
+        return self.neural.shape[1]
+
+    @property
+    def continuous_index(self):
+        if self.continuous is None:
+            raise NotImplementedError()
+        return self.continuous
+
+    @property
+    def discrete_index(self):
+        if self.discrete is None:
+            raise NotImplementedError()
+        return self.discrete
+
+    def __len__(self):
+        return len(self.neural)
+
+    def __getitem__(self, index):
+        index = self.expand_index(index)
+        return self.neural[index].transpose(2, 1)
+
+
+class KirbyDatasetAdapter(cebra_data.SingleSessionDataset):
+    """Adapter to use kirby.data.Dataset with CEBRA's data loading infrastructure.
+
+    This class wraps a kirby Dataset and makes it compatible with CEBRA's
+    SingleSessionDataset interface. It extracts neural data and auxiliary
+    variables from kirby Data objects and presents them in CEBRA's format.
+
+    Args:
+        kirby_dataset: A kirby.data.Dataset instance containing session data
+        session_id: The session ID to extract from the kirby dataset
+        continuous_keys: List of keys in kirby Data objects to use as continuous indices
+        discrete_keys: List of keys in kirby Data objects to use as discrete indices
+        device: Device to store the data on (default: "cpu")
+
+    Example:
+        >>> from kirby.data import Dataset as KirbyDataset
+        >>> kirby_ds = KirbyDataset(root="data", split="train", include=[...])
+        >>> session_id = kirby_ds.session_ids[0]
+        >>> adapter = KirbyDatasetAdapter(
+        ...     kirby_dataset=kirby_ds,
+        ...     session_id=session_id,
+        ...     continuous_keys=['timestamps'],
+        ... )
+    """
+
+    def __init__(
+        self,
+        kirby_dataset: "KirbyDataset",
+        session_id: str,
+        continuous_keys: Optional[List[str]] = None,
+        discrete_keys: Optional[List[str]] = None,
+        neural_key: str = "patches",
+        device: str = "cpu",
+    ):
+        if not KIRBY_AVAILABLE:
+            raise ImportError(
+                "kirby package is not available. Please ensure kirby is installed "
+                "and accessible in your Python environment."
+            )
+
+        super().__init__(device=device)
+        self.kirby_dataset = kirby_dataset
+        self.session_id = session_id
+        self.continuous_keys = continuous_keys or []
+        self.discrete_keys = discrete_keys or []
+        self.neural_key = neural_key
+        self.offset = Offset(0, 1)
+
+        # Get the full session data
+        self.session_data = kirby_dataset.get_session_data(session_id)
+
+        # Extract neural data
+        if hasattr(self.session_data, neural_key):
+            neural_data = getattr(self.session_data, neural_key)
+            if hasattr(neural_data, 'obj'):
+                neural_data = neural_data.obj
+            self.neural = self._to_tensor(neural_data).float()
+        else:
+            raise ValueError(f"Session data does not contain neural key '{neural_key}'")
+
+        # Extract continuous indices
+        if self.continuous_keys:
+            continuous_list = []
+            for key in self.continuous_keys:
+                if hasattr(self.session_data, key):
+                    data = getattr(self.session_data, key)
+                    if hasattr(data, 'obj'):
+                        data = data.obj
+                    continuous_list.append(self._to_tensor(data))
+            if continuous_list:
+                self.continuous = torch.cat([
+                    d.reshape(-1, 1) if d.ndim == 1 else d
+                    for d in continuous_list
+                ], dim=1).float()
+            else:
+                self.continuous = None
+        else:
+            self.continuous = None
+
+        # Extract discrete indices
+        if self.discrete_keys:
+            discrete_list = []
+            for key in self.discrete_keys:
+                if hasattr(self.session_data, key):
+                    data = getattr(self.session_data, key)
+                    if hasattr(data, 'obj'):
+                        data = data.obj
+                    discrete_list.append(self._to_tensor(data))
+            if discrete_list:
+                self.discrete = torch.cat([
+                    d.reshape(-1, 1) if d.ndim == 1 else d
+                    for d in discrete_list
+                ], dim=1).long()
+            else:
+                self.discrete = None
+        else:
+            self.discrete = None
+
+    def _to_tensor(self, array: Union[torch.Tensor, npt.NDArray]) -> torch.Tensor:
+        """Convert numpy array to torch tensor if necessary."""
+        if array is None:
+            return None
+        if isinstance(array, np.ndarray):
+            array = torch.from_numpy(array)
         return array
 
     @property
@@ -303,6 +443,73 @@ class DatasetCollection(cebra_data.MultiSessionDataset):
 
     def _iter_property(self, attr):
         return (getattr(data, attr) for data in self.iter_sessions())
+
+    @classmethod
+    def from_kirby_dataset(
+        cls,
+        kirby_dataset: "KirbyDataset",
+        continuous_keys: Optional[List[str]] = None,
+        discrete_keys: Optional[List[str]] = None,
+        neural_key: str = "patches",
+        device: str = "cpu",
+        session_ids: Optional[List[str]] = None,
+    ) -> "DatasetCollection":
+        """Create a DatasetCollection from a kirby Dataset.
+
+        This class method provides a convenient way to convert a kirby Dataset
+        containing multiple sessions into a CEBRA DatasetCollection. Each session
+        in the kirby Dataset will be wrapped in a KirbyDatasetAdapter and added
+        to the collection.
+
+        Args:
+            kirby_dataset: A kirby.data.Dataset instance containing multiple sessions
+            continuous_keys: List of keys to extract as continuous indices
+                (e.g., ['timestamps'])
+            discrete_keys: List of keys to extract as discrete indices
+                (e.g., ['unit_cre_line'])
+            neural_key: Key for neural data in kirby Data objects (default: "patches")
+            device: Device to store data on (default: "cpu")
+            session_ids: Optional list of specific session IDs to include.
+                If None, all sessions will be included.
+
+        Returns:
+            A DatasetCollection containing adapted kirby sessions
+
+        Example:
+            >>> from kirby.data import Dataset as KirbyDataset
+            >>> from cebra.data import DatasetCollection
+            >>> kirby_ds = KirbyDataset(root="data", split="train", include=[...])
+            >>> collection = DatasetCollection.from_kirby_dataset(
+            ...     kirby_dataset=kirby_ds,
+            ...     continuous_keys=['timestamps'],
+            ...     discrete_keys=['unit_cre_line'],
+            ... )
+        """
+        if not KIRBY_AVAILABLE:
+            raise ImportError(
+                "kirby package is not available. Please ensure kirby is installed "
+                "and accessible in your Python environment."
+            )
+
+        # Determine which sessions to include
+        if session_ids is None:
+            session_ids = kirby_dataset.session_ids
+
+        # Create adapters for each session
+        adapters = []
+        for session_id in session_ids:
+            adapter = KirbyDatasetAdapter(
+                kirby_dataset=kirby_dataset,
+                session_id=session_id,
+                continuous_keys=continuous_keys,
+                discrete_keys=discrete_keys,
+                neural_key=neural_key,
+                device=device,
+            )
+            adapters.append(adapter)
+
+        # Create and return the DatasetCollection
+        return cls(*adapters)
 
 
 # TODO(stes): This should be a single session dataset?

@@ -1,0 +1,101 @@
+# Allen Brain Observatory Configuration for CEBRA Training
+# Dataset: Allen Brain Observatory Visual Coding - Calcium Imaging
+
+dataset:
+  name: "allen_brain_observatory_calcium"
+  data_dir: "data"
+  file_pattern: "*.h5"
+
+  # Data splits
+  splits:
+    train: "train_mask"
+    valid: "valid_mask"
+    test: "test_mask"
+
+  # Neural data configuration
+  neural:
+    dataset_key: "calcium_traces/df_over_f"  # (timepoints, neurons)
+    dtype: "float32"
+    normalize: true  # Apply z-score normalization
+
+  # Temporal information
+  temporal:
+    domain_start_key: "calcium_traces/domain/start"
+    domain_end_key: "calcium_traces/domain/end"
+    use_timestamps: true
+
+  # Session configuration
+  sessions:
+    max_sessions: null  # null = use all sessions, or specify number
+    session_ids: null   # null = use all, or list specific session IDs
+
+# CEBRA Model Configuration (poyo-ssl style)
+model:
+  architecture: "offset10-model"
+  output_dimension: 32
+  model_architecture: "offset10-model"
+
+  # Self-supervised learning
+  learning_mode: "time_contrastive"  # poyo-ssl style
+  conditional: "time_delta"
+
+  # Training hyperparameters
+  batch_size: 4
+  learning_rate: 0.0003
+  temperature: 1.0
+  max_iterations: 5000
+
+  # Distance metric
+  distance: "cosine"
+
+  # Device
+  device: "cuda_if_available"
+
+  # Logging
+  verbose: true
+
+# DataLoader Configuration
+dataloader:
+  batch_size: 4
+  num_workers: 0
+  shuffle: true
+  drop_last: false
+
+  # For CEBRA's ContinuousDataLoader
+  num_steps: 10
+  time_offset: 10
+
+# Training Configuration
+training:
+  max_epochs: 100
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+
+  # Checkpointing
+  checkpoint:
+    enabled: true
+    save_dir: "checkpoints"
+    save_frequency: 10  # Save every N epochs
+
+  # Validation
+  validation:
+    enabled: true
+    frequency: 5  # Validate every N epochs
+
+# Output Configuration
+output:
+  save_dir: "results"
+  save_embeddings: true
+  save_model: true
+
+  # Visualization
+  visualize:
+    enabled: true
+    plot_loss: true
+    plot_embeddings: true
+
+# Reproducibility
+seed: 42
+deterministic: true

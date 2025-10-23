@@ -1,0 +1,99 @@
+{
+  "timestamp": "20251023_154103",
+  "num_sessions": 4,
+  "train_shapes": [
+    [
+      32187,
+      150
+    ],
+    [
+      32243,
+      240
+    ],
+    [
+      32215,
+      227
+    ],
+    [
+      32235,
+      181
+    ]
+  ],
+  "config": {
+    "dataset": {
+      "name": "allen_brain_observatory_calcium",
+      "data_dir": "data",
+      "file_pattern": "*.h5",
+      "splits": {
+        "train": "train_mask",
+        "valid": "valid_mask",
+        "test": "test_mask"
+      },
+      "neural": {
+        "dataset_key": "calcium_traces/df_over_f",
+        "dtype": "float32",
+        "normalize": true
+      },
+      "temporal": {
+        "domain_start_key": "calcium_traces/domain/start",
+        "domain_end_key": "calcium_traces/domain/end",
+        "use_timestamps": true
+      },
+      "sessions": {
+        "max_sessions": 4,
+        "session_ids": null
+      }
+    },
+    "model": {
+      "architecture": "offset10-model",
+      "output_dimension": 32,
+      "model_architecture": "offset10-model",
+      "learning_mode": "time_contrastive",
+      "conditional": "time_delta",
+      "batch_size": 4,
+      "learning_rate": 0.0003,
+      "temperature": 1.0,
+      "max_iterations": 5000,
+      "distance": "cosine",
+      "device": "cuda_if_available",
+      "verbose": true
+    },
+    "dataloader": {
+      "batch_size": 4,
+      "num_workers": 0,
+      "shuffle": true,
+      "drop_last": false,
+      "num_steps": 10,
+      "time_offset": 10
+    },
+    "training": {
+      "max_epochs": 100,
+      "early_stopping": {
+        "enabled": true,
+        "patience": 10,
+        "min_delta": 0.001
+      },
+      "checkpoint": {
+        "enabled": true,
+        "save_dir": "checkpoints",
+        "save_frequency": 10
+      },
+      "validation": {
+        "enabled": true,
+        "frequency": 5
+      }
+    },
+    "output": {
+      "save_dir": "results",
+      "save_embeddings": true,
+      "save_model": true,
+      "visualize": {
+        "enabled": true,
+        "plot_loss": true,
+        "plot_embeddings": true
+      }
+    },
+    "seed": 42,
+    "deterministic": true
+  }
+}

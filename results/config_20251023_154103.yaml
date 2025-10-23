@@ -1,0 +1,62 @@
+dataloader:
+  batch_size: 4
+  drop_last: false
+  num_steps: 10
+  num_workers: 0
+  shuffle: true
+  time_offset: 10
+dataset:
+  data_dir: data
+  file_pattern: '*.h5'
+  name: allen_brain_observatory_calcium
+  neural:
+    dataset_key: calcium_traces/df_over_f
+    dtype: float32
+    normalize: true
+  sessions:
+    max_sessions: 4
+    session_ids: null
+  splits:
+    test: test_mask
+    train: train_mask
+    valid: valid_mask
+  temporal:
+    domain_end_key: calcium_traces/domain/end
+    domain_start_key: calcium_traces/domain/start
+    use_timestamps: true
+deterministic: true
+model:
+  architecture: offset10-model
+  batch_size: 4
+  conditional: time_delta
+  device: cuda_if_available
+  distance: cosine
+  learning_mode: time_contrastive
+  learning_rate: 0.0003
+  max_iterations: 5000
+  model_architecture: offset10-model
+  output_dimension: 32
+  temperature: 1.0
+  verbose: true
+output:
+  save_dir: results
+  save_embeddings: true
+  save_model: true
+  visualize:
+    enabled: true
+    plot_embeddings: true
+    plot_loss: true
+seed: 42
+training:
+  checkpoint:
+    enabled: true
+    save_dir: checkpoints
+    save_frequency: 10
+  early_stopping:
+    enabled: true
+    min_delta: 0.001
+    patience: 10
+  max_epochs: 100
+  validation:
+    enabled: true
+    frequency: 5
