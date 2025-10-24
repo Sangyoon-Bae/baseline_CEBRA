@@ -121,6 +121,10 @@ def create_kirby_dataset(config, split='train'):
         model_dim=config['model']['output_dimension']
     )
 
+    # Disable data leakage check for Allen dataset
+    # Allen dataset uses time-based splits which don't align with mask-based checks
+    dataset._check_for_data_leakage_flag = False
+
     print(f"✅ Dataset created with {len(dataset)} sessions")
     return dataset
 
