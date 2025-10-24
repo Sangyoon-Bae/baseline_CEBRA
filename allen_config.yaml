@@ -67,7 +67,7 @@ dataloader:
 
 # Training Configuration
 training:
-  max_epochs: 100
+  max_epochs: 25
   early_stopping:
     enabled: true
     patience: 10
@@ -88,7 +88,7 @@ training:
 decoder:
   latent_dim: 1024  # Latent dimension for HalfUNet
   learning_rate: 0.001
-  num_epochs: 50
+  num_epochs: 25
   batch_size: 32
 
   # Loss weights (6 losses for comprehensive image reconstruction)
