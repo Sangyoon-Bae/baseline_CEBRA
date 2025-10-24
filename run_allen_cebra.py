@@ -250,10 +250,10 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
     print(f"Output shape: {output_shape}")
 
     # Initialize HalfUNet
+    # HalfUNet expects: in_channels, out_channels, latent_dim
     decoder = HalfUNet(
-        input_dim=model_dim,
-        output_channels=1,  # Grayscale movie frames
-        output_shape=output_shape,
+        in_channels=1,
+        out_channels=1,  # Grayscale movie frames
         latent_dim=config.get('decoder', {}).get('latent_dim', 1024)
     ).to(device)
 
