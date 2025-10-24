@@ -222,6 +222,55 @@ def extract_neural_data(session_data):
 
     return neural_data
 
+
+def extract_movie_frames(session_data, dataset):
+    """
+    Extract movie frames from session_data and dataset.
+
+    For Allen dataset, frame numbers are stored in natural_movie_one.frame_number,
+    and actual frames are in dataset.movie_frames.
+
+    Args:
+        session_data: Data object from dataset
+        dataset: The dataset object (has movie_frames attribute)
+
+    Returns:
+        torch.Tensor of movie frames, shape (T, H, W)
+    """
+    # Check if movie_frames directly exists (from __getitem__)
+    if hasattr(session_data, 'movie_frames'):
+        return session_data.movie_frames
+
+    # For Allen dataset, extract from natural_movie_one
+    if hasattr(session_data, 'natural_movie_one'):
+        natural_movie = session_data.natural_movie_one
+
+        # Get frame indices
+        if hasattr(natural_movie, 'frame_number'):
+            frame_indices_raw = natural_movie.frame_number
+
+            # Convert to numpy if needed
+            if hasattr(frame_indices_raw, 'cpu'):
+                frame_indices = frame_indices_raw.cpu().numpy()
+            elif hasattr(frame_indices_raw, 'numpy'):
+                frame_indices = frame_indices_raw.numpy()
+            else:
+                frame_indices = frame_indices_raw
+
+            # Convert to integers
+            frame_indices = frame_indices.squeeze().astype(int)
+
+            # Get actual movie frames from dataset
+            if hasattr(dataset, 'movie_frames'):
+                movie_frames = dataset.movie_frames[frame_indices, :, :]
+                return torch.from_numpy(movie_frames).float()
+            else:
+                raise AttributeError(f"Dataset does not have movie_frames attribute")
+        else:
+            raise AttributeError(f"natural_movie_one does not have frame_number attribute")
+
+    raise AttributeError(f"Cannot extract movie frames. Available attributes: {session_data.keys}")
+
 def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device='cuda', wandb_run=None):
     """
     Train CEBRA and HalfUNet jointly end-to-end
@@ -346,7 +395,7 @@ def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device=
 
                 # Get neural data and movie frames
                 neural_data = extract_neural_data(session_data)
-                movie_frames = session_data.movie_frames  # Shape: (T, H, W)
+                movie_frames = extract_movie_frames(session_data, train_dataset)  # Shape: (T, H, W)
 
                 # Convert neural data to torch tensor
                 neural_data_tensor = torch.from_numpy(neural_data).float().to(device)
@@ -434,7 +483,7 @@ def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device=
                     session_data = valid_dataset.get_session_data(session_id)
 
                     neural_data = extract_neural_data(session_data)
-                    movie_frames = session_data.movie_frames
+                    movie_frames = extract_movie_frames(session_data, valid_dataset)
 
                     # Convert neural data to torch tensor
                     neural_data_tensor = torch.from_numpy(neural_data).float().to(device)
@@ -581,8 +630,8 @@ def visualize_results(decoder, cebra_model, test_dataset, output_dir, device='cu
         session_id = test_dataset.session_ids[0]
         session_data = test_dataset.get_session_data(session_id)
 
-        neural_data = session_data.patches.obj.cpu().numpy()
-        movie_frames = session_data.movie_frames
+        neural_data = extract_neural_data(session_data)
+        movie_frames = extract_movie_frames(session_data, test_dataset)
 
         # Generate embeddings and predictions
         embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
@@ -596,7 +645,11 @@ def visualize_results(decoder, cebra_model, test_dataset, output_dir, device='cu
 
         for i, idx in enumerate(indices):
             # Original frame
-            axes[i, 0].imshow(movie_frames[idx].cpu().numpy(), cmap='gray')
+            if isinstance(movie_frames, torch.Tensor):
+                frame_img = movie_frames[idx].cpu().numpy()
+            else:
+                frame_img = movie_frames[idx]
+            axes[i, 0].imshow(frame_img, cmap='gray')
             axes[i, 0].set_title(f'Original Frame {idx}')
             axes[i, 0].axis('off')
 
