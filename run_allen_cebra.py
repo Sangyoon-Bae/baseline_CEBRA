@@ -134,16 +134,17 @@ def create_kirby_dataset(config, split='train'):
     print(f"✅ Dataset created with {len(dataset)} sessions")
     return dataset
 
-def initialize_cebra_model(config, device='cuda'):
+def initialize_cebra_model(config, train_dataset, device='cuda'):
     """
-    Initialize CEBRA model (without training)
+    Initialize CEBRA model with minimal training to set up solver
 
     Args:
         config: Configuration dictionary
+        train_dataset: Training dataset (to get sample data for initialization)
         device: Device to use
 
     Returns:
-        Initialized CEBRA model
+        Initialized CEBRA model with solver ready
     """
     if not CEBRA_AVAILABLE:
         raise ImportError("CEBRA is not available. Please install it.")
@@ -152,18 +153,32 @@ def initialize_cebra_model(config, device='cuda'):
     print("Initializing CEBRA Model")
     print(f"{'='*80}")
 
+    # Get first session data for initialization
+    session_data = train_dataset.get_session_data(train_dataset.session_ids[0])
+    neural_data = extract_neural_data(session_data)
+
+    print(f"Using sample data shape: {neural_data.shape} for CEBRA initialization")
+
     # Initialize CEBRA model
     cebra_model = cebra.CEBRA(
         model_architecture=config['model']['model_architecture'],
         batch_size=config['model']['batch_size'],
         learning_rate=config['model']['learning_rate'],
-        max_iterations=config['model']['max_iterations'],
+        max_iterations=10,  # Just a few iterations to initialize solver
         output_dimension=config['model']['output_dimension'],
         device=device if device != 'cpu' else 'cpu',
-        verbose=config['model']['verbose'],
+        verbose=False,  # Don't show progress for initialization
     )
 
-    print("✅ CEBRA model initialized (will be trained jointly with decoder)")
+    # Fit with minimal iterations to initialize the solver
+    print("Initializing CEBRA solver (10 iterations)...")
+    cebra_model.fit(neural_data)
+
+    # Now reset max_iterations for actual joint training
+    cebra_model.max_iterations = config['model']['max_iterations']
+    cebra_model.verbose = config['model']['verbose']
+
+    print("✅ CEBRA model initialized with solver ready for joint training")
 
     return cebra_model
 
@@ -274,20 +289,22 @@ def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device=
     print(f"  FFT Loss (weight: {loss_weights['fft']})")
 
     # Get CEBRA's internal PyTorch model
-    # CEBRA wraps a PyTorch model, we need to access it for joint training
-    if hasattr(cebra_model, 'model'):
+    # CEBRA wraps a PyTorch model in its solver_
+    if hasattr(cebra_model, 'solver_') and cebra_model.solver_ is not None:
+        if hasattr(cebra_model.solver_, 'model'):
+            cebra_net = cebra_model.solver_.model
+        else:
+            cebra_net = cebra_model.solver_
+    elif hasattr(cebra_model, 'model'):
         cebra_net = cebra_model.model
-    elif hasattr(cebra_model, 'net'):
-        cebra_net = cebra_model.net
     else:
-        # Fallback: try to use cebra_model directly
-        cebra_net = cebra_model
+        raise AttributeError("Cannot access CEBRA's internal PyTorch model. Make sure CEBRA is initialized.")
 
     # Move CEBRA network to device
-    if hasattr(cebra_net, 'to'):
-        cebra_net = cebra_net.to(device)
+    cebra_net = cebra_net.to(device)
 
     print(f"\n✅ CEBRA network extracted for joint training")
+    print(f"   CEBRA network type: {type(cebra_net)}")
 
     # Joint optimizer for both CEBRA and decoder
     # Combine parameters from both models
@@ -337,13 +354,9 @@ def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device=
                 # Generate CEBRA embeddings using forward pass (keep gradients!)
                 # This allows gradients to flow back to CEBRA
                 cebra_net.train()
-                if hasattr(cebra_net, 'encode'):
-                    embeddings = cebra_net.encode(neural_data_tensor)
-                elif hasattr(cebra_net, 'forward'):
-                    embeddings = cebra_net(neural_data_tensor)
-                else:
-                    # Fallback: use transform but won't have gradients
-                    embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
+
+                # CEBRA's model.forward() expects the input and returns embeddings
+                embeddings = cebra_net(neural_data_tensor)
 
                 # Prepare movie frames
                 targets = movie_frames.unsqueeze(1).float().to(device)  # Add channel dim
@@ -427,12 +440,7 @@ def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device=
                     neural_data_tensor = torch.from_numpy(neural_data).float().to(device)
 
                     # Generate CEBRA embeddings
-                    if hasattr(cebra_net, 'encode'):
-                        embeddings = cebra_net.encode(neural_data_tensor)
-                    elif hasattr(cebra_net, 'forward'):
-                        embeddings = cebra_net(neural_data_tensor)
-                    else:
-                        embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
+                    embeddings = cebra_net(neural_data_tensor)
 
                     targets = movie_frames.unsqueeze(1).float().to(device)
 
@@ -728,8 +736,8 @@ def main():
         cebra_model = cebra.CEBRA.load(args.cebra_model_path)
         print("Note: Using pre-trained CEBRA. Joint training will still fine-tune it.")
     else:
-        # Initialize CEBRA model (not trained yet)
-        cebra_model = initialize_cebra_model(config, device=device)
+        # Initialize CEBRA model with solver
+        cebra_model = initialize_cebra_model(config, train_dataset, device=device)
 
     # Joint training: CEBRA + HalfUNet decoder
     print("\n" + "="*80)
