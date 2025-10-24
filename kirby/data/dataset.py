@@ -657,7 +657,7 @@ class Dataset(torch.utils.data.Dataset):
             end = session_info["sampling_intervals"].end
 
             if sampling_intervals_modifier_code is None:
-                if end-start != 0:
+                if np.any(end-start != 0):
                     interval_dict[session_id] = list(
                         zip(
                             session_info["sampling_intervals"].start,
