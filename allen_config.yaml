@@ -91,11 +91,14 @@ decoder:
   num_epochs: 50
   batch_size: 32
 
-  # Loss weights
+  # Loss weights (6 losses for comprehensive image reconstruction)
   loss_weights:
-    mse: 1.0
-    ssim: 0.5
-    multiscale: 0.3
+    l1: 1.0          # L1 Loss - robust pixel-level reconstruction
+    ssim: 0.5        # SSIM Loss - structural similarity
+    perceptual: 0.3  # Perceptual Loss (AlexNet) - high-level semantic features
+    gradient: 0.2    # Gradient Difference Loss - edge preservation
+    focal: 0.1       # Focal Loss - focus on hard examples
+    fft: 0.2         # FFT Loss - frequency domain matching
 
 # Output Configuration
 output:

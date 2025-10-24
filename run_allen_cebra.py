@@ -23,7 +23,13 @@ import os
 
 # Import kirby modules
 from kirby.data.dataset import Dataset as KirbyDataset
-from kirby.nn.loss import compute_loss_or_metric, SSIMLoss, MultiScaleLoss
+from kirby.nn.loss import (
+    SSIMLoss,
+    AlexNetPerceptualLoss,
+    GradientDifferenceLoss,
+    FocalLoss,
+    FFTLoss
+)
 from kirby.nn.unet import HalfUNet
 
 # Import CEBRA
@@ -153,55 +159,8 @@ def train_cebra_model(config, train_dataset):
     # Print available attributes to understand data structure
     print(f"Session data attributes: {session_data.keys}")
 
-    # Extract neural data - Allen dataset uses calcium_traces attribute
-    if hasattr(session_data, 'calcium_traces'):
-        calcium_traces = session_data.calcium_traces
-        print(f"\nCalcium traces type: {type(calcium_traces)}")
-        print(f"Calcium traces attributes (keys): {calcium_traces.keys}")
-
-        # Check which attribute contains the actual neural data
-        for key in calcium_traces.keys:
-            attr = getattr(calcium_traces, key)
-            print(f"  - {key}: type={type(attr)}, shape={getattr(attr, 'shape', 'N/A')}")
-
-        # Try to get the neural data from the most likely attributes
-        if hasattr(calcium_traces, 'df_over_f'):
-            neural_data_raw = calcium_traces.df_over_f
-            print(f"\nFound df_over_f attribute")
-        elif hasattr(calcium_traces, 'data'):
-            neural_data_raw = calcium_traces.data
-            print(f"\nFound data attribute")
-        elif len(calcium_traces.keys) > 0:
-            # Use the first non-timestamp attribute
-            data_key = [k for k in calcium_traces.keys if 'timestamp' not in k.lower()][0]
-            neural_data_raw = getattr(calcium_traces, data_key)
-            print(f"\nUsing attribute: {data_key}")
-        else:
-            raise AttributeError(f"Cannot find neural data in calcium_traces. Keys: {calcium_traces.keys}")
-
-        # Convert to numpy if it's a torch tensor
-        if hasattr(neural_data_raw, 'cpu'):
-            neural_data = neural_data_raw.cpu().numpy()
-        elif hasattr(neural_data_raw, 'numpy'):
-            neural_data = neural_data_raw.numpy()
-        else:
-            neural_data = neural_data_raw
-
-        print(f"Using calcium_traces data")
-
-    elif hasattr(session_data, 'patches'):
-        patches = session_data.patches
-        print(f"\nPatches type: {type(patches)}")
-
-        if hasattr(patches, 'obj'):
-            neural_data = patches.obj.cpu().numpy()
-        else:
-            # Assume patches itself is the data
-            neural_data = patches if isinstance(patches, np.ndarray) else patches.cpu().numpy()
-        print(f"Using patches data")
-    else:
-        raise AttributeError(f"No suitable neural data found. Available attributes: {session_data.keys}")
-
+    # Extract neural data using helper function
+    neural_data = extract_neural_data(session_data)
     print(f"Neural data shape: {neural_data.shape}")
 
     # Initialize CEBRA model
@@ -220,6 +179,46 @@ def train_cebra_model(config, train_dataset):
     print("✅ CEBRA training complete!")
 
     return cebra_model
+
+def extract_neural_data(session_data):
+    """
+    Extract neural data from session_data object.
+    Handles both Allen dataset (calcium_traces) and other datasets (patches).
+
+    Args:
+        session_data: Data object from dataset
+
+    Returns:
+        numpy array of neural data
+    """
+    if hasattr(session_data, 'calcium_traces'):
+        # Allen dataset uses calcium_traces
+        calcium_traces = session_data.calcium_traces
+        if hasattr(calcium_traces, 'df_over_f'):
+            neural_data_raw = calcium_traces.df_over_f
+        else:
+            # Use first available key
+            data_key = [k for k in calcium_traces.keys if 'timestamp' not in k.lower()][0]
+            neural_data_raw = getattr(calcium_traces, data_key)
+    elif hasattr(session_data, 'patches'):
+        # Other datasets use patches
+        patches = session_data.patches
+        if hasattr(patches, 'obj'):
+            neural_data_raw = patches.obj
+        else:
+            neural_data_raw = patches
+    else:
+        raise AttributeError(f"No suitable neural data found. Available attributes: {session_data.keys}")
+
+    # Convert to numpy if it's a torch tensor
+    if hasattr(neural_data_raw, 'cpu'):
+        neural_data = neural_data_raw.cpu().numpy()
+    elif hasattr(neural_data_raw, 'numpy'):
+        neural_data = neural_data_raw.numpy()
+    else:
+        neural_data = neural_data_raw
+
+    return neural_data
 
 def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, device='cuda', wandb_run=None):
     """
@@ -257,10 +256,31 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
         latent_dim=config.get('decoder', {}).get('latent_dim', 1024)
     ).to(device)
 
-    # Loss functions
+    # Loss functions (6 losses as specified)
     ssim_loss = SSIMLoss()
-    mse_loss = nn.MSELoss()
-    multiscale_loss = MultiScaleLoss(loss_type='l1', scales=[1.0, 0.5, 0.25])
+    perceptual_loss = AlexNetPerceptualLoss(layer=3)
+    gradient_loss = GradientDifferenceLoss(channels=1, loss_type='l1')  # 1 channel for grayscale
+    focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
+    fft_loss = FFTLoss(loss_type='l1')
+    l1_loss = nn.L1Loss()
+
+    # Loss weights (read from config or use defaults)
+    loss_weights = config.get('decoder', {}).get('loss_weights', {
+        'l1': 1.0,
+        'ssim': 0.5,
+        'perceptual': 0.3,
+        'gradient': 0.2,
+        'focal': 0.1,
+        'fft': 0.2
+    })
+
+    print(f"\nLoss configuration:")
+    print(f"  L1 Loss (weight: {loss_weights['l1']})")
+    print(f"  SSIM Loss (weight: {loss_weights['ssim']})")
+    print(f"  Perceptual Loss - AlexNet (weight: {loss_weights['perceptual']})")
+    print(f"  Gradient Difference Loss (weight: {loss_weights['gradient']})")
+    print(f"  Focal Loss (weight: {loss_weights['focal']})")
+    print(f"  FFT Loss (weight: {loss_weights['fft']})")
 
     # Optimizer
     optimizer = torch.optim.Adam(
@@ -283,6 +303,10 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
     for epoch in range(num_epochs):
         decoder.train()
         train_losses = []
+        train_loss_details = {
+            'l1': [], 'ssim': [], 'perceptual': [],
+            'gradient': [], 'focal': [], 'fft': []
+        }
 
         # Training phase
         for session_id in tqdm(train_dataset.session_ids, desc=f"Epoch {epoch+1}/{num_epochs}"):
@@ -290,7 +314,7 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
                 session_data = train_dataset.get_session_data(session_id)
 
                 # Get neural data and movie frames
-                neural_data = session_data.patches.obj.cpu().numpy()
+                neural_data = extract_neural_data(session_data)
                 movie_frames = session_data.movie_frames  # Shape: (T, H, W)
 
                 # Generate CEBRA embeddings
@@ -311,19 +335,41 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
                     # Forward pass
                     predictions = decoder(batch_embeddings)
 
-                    # Compute loss (combination of losses)
-                    loss_mse = mse_loss(predictions, batch_targets)
-                    loss_ssim = ssim_loss(predictions, batch_targets)
-                    loss_multiscale = multiscale_loss(predictions, batch_targets)
+                    # Ensure predictions have channel dimension
+                    if predictions.dim() == 3:
+                        predictions = predictions.unsqueeze(1)
 
-                    total_loss = loss_mse + 0.5 * loss_ssim + 0.3 * loss_multiscale
+                    # Compute all 6 losses
+                    loss_l1_val = l1_loss(predictions, batch_targets)
+                    loss_ssim_val = ssim_loss(predictions, batch_targets)
+                    loss_perceptual_val = perceptual_loss(predictions, batch_targets)
+                    loss_gradient_val = gradient_loss(predictions, batch_targets)
+                    loss_focal_val = focal_loss(predictions, batch_targets)
+                    loss_fft_val = fft_loss(predictions, batch_targets)
+
+                    # Weighted combination of losses
+                    total_loss = (
+                        loss_weights['l1'] * loss_l1_val +
+                        loss_weights['ssim'] * loss_ssim_val +
+                        loss_weights['perceptual'] * loss_perceptual_val +
+                        loss_weights['gradient'] * loss_gradient_val +
+                        loss_weights['focal'] * loss_focal_val +
+                        loss_weights['fft'] * loss_fft_val
+                    )
 
                     # Backward pass
                     optimizer.zero_grad()
                     total_loss.backward()
                     optimizer.step()
 
+                    # Track losses
                     train_losses.append(total_loss.item())
+                    train_loss_details['l1'].append(loss_l1_val.item())
+                    train_loss_details['ssim'].append(loss_ssim_val.item())
+                    train_loss_details['perceptual'].append(loss_perceptual_val.item())
+                    train_loss_details['gradient'].append(loss_gradient_val.item())
+                    train_loss_details['focal'].append(loss_focal_val.item())
+                    train_loss_details['fft'].append(loss_fft_val.item())
 
             except Exception as e:
                 print(f"Warning: Error processing session {session_id}: {e}")
@@ -334,7 +380,10 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
         # Validation phase
         decoder.eval()
         valid_losses = []
-        valid_ssim_scores = []
+        valid_loss_details = {
+            'l1': [], 'ssim': [], 'perceptual': [],
+            'gradient': [], 'focal': [], 'fft': []
+        }
 
         # For wandb image logging (save first batch of predictions)
         first_predictions = None
@@ -345,7 +394,7 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
                 try:
                     session_data = valid_dataset.get_session_data(session_id)
 
-                    neural_data = session_data.patches.obj.cpu().numpy()
+                    neural_data = extract_neural_data(session_data)
                     movie_frames = session_data.movie_frames
 
                     embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
@@ -353,15 +402,36 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
 
                     predictions = decoder(embeddings)
 
-                    loss_mse = mse_loss(predictions, targets)
-                    loss_ssim = ssim_loss(predictions, targets)
+                    # Ensure predictions have channel dimension
+                    if predictions.dim() == 3:
+                        predictions = predictions.unsqueeze(1)
 
-                    total_loss = loss_mse + 0.5 * loss_ssim
+                    # Compute all 6 losses
+                    loss_l1_val = l1_loss(predictions, targets)
+                    loss_ssim_val = ssim_loss(predictions, targets)
+                    loss_perceptual_val = perceptual_loss(predictions, targets)
+                    loss_gradient_val = gradient_loss(predictions, targets)
+                    loss_focal_val = focal_loss(predictions, targets)
+                    loss_fft_val = fft_loss(predictions, targets)
+
+                    # Weighted combination of losses
+                    total_loss = (
+                        loss_weights['l1'] * loss_l1_val +
+                        loss_weights['ssim'] * loss_ssim_val +
+                        loss_weights['perceptual'] * loss_perceptual_val +
+                        loss_weights['gradient'] * loss_gradient_val +
+                        loss_weights['focal'] * loss_focal_val +
+                        loss_weights['fft'] * loss_fft_val
+                    )
+
+                    # Track losses
                     valid_losses.append(total_loss.item())
-
-                    # Calculate SSIM metric (1 - loss since SSIMLoss returns 1-SSIM)
-                    ssim_score = 1.0 - loss_ssim.item()
-                    valid_ssim_scores.append(ssim_score)
+                    valid_loss_details['l1'].append(loss_l1_val.item())
+                    valid_loss_details['ssim'].append(loss_ssim_val.item())
+                    valid_loss_details['perceptual'].append(loss_perceptual_val.item())
+                    valid_loss_details['gradient'].append(loss_gradient_val.item())
+                    valid_loss_details['focal'].append(loss_focal_val.item())
+                    valid_loss_details['fft'].append(loss_fft_val.item())
 
                     # Save first batch for visualization
                     if idx == 0 and wandb_run is not None:
@@ -372,17 +442,44 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
                     continue
 
         avg_valid_loss = np.mean(valid_losses) if valid_losses else float('inf')
-        avg_valid_ssim = np.mean(valid_ssim_scores) if valid_ssim_scores else 0.0
 
-        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}, Valid Loss: {avg_valid_loss:.4f}, Valid SSIM: {avg_valid_ssim:.4f}")
+        # Calculate average for each loss component
+        avg_train_loss_details = {k: np.mean(v) if v else 0.0 for k, v in train_loss_details.items()}
+        avg_valid_loss_details = {k: np.mean(v) if v else 0.0 for k, v in valid_loss_details.items()}
+
+        # Print summary
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        print(f"  Train Loss: {avg_train_loss:.4f} | Valid Loss: {avg_valid_loss:.4f}")
+        print(f"  Loss breakdown (train/valid):")
+        print(f"    L1:         {avg_train_loss_details['l1']:.4f} / {avg_valid_loss_details['l1']:.4f}")
+        print(f"    SSIM:       {avg_train_loss_details['ssim']:.4f} / {avg_valid_loss_details['ssim']:.4f}")
+        print(f"    Perceptual: {avg_train_loss_details['perceptual']:.4f} / {avg_valid_loss_details['perceptual']:.4f}")
+        print(f"    Gradient:   {avg_train_loss_details['gradient']:.4f} / {avg_valid_loss_details['gradient']:.4f}")
+        print(f"    Focal:      {avg_train_loss_details['focal']:.4f} / {avg_valid_loss_details['focal']:.4f}")
+        print(f"    FFT:        {avg_train_loss_details['fft']:.4f} / {avg_valid_loss_details['fft']:.4f}")
 
         # Log to wandb
         if wandb_run is not None:
             log_dict = {
                 'epoch': epoch + 1,
-                'train_loss': avg_train_loss,
-                'valid_loss': avg_valid_loss,
-                'valid_ssim': avg_valid_ssim,
+                'train/total_loss': avg_train_loss,
+                'valid/total_loss': avg_valid_loss,
+
+                # Train loss components
+                'train/l1_loss': avg_train_loss_details['l1'],
+                'train/ssim_loss': avg_train_loss_details['ssim'],
+                'train/perceptual_loss': avg_train_loss_details['perceptual'],
+                'train/gradient_loss': avg_train_loss_details['gradient'],
+                'train/focal_loss': avg_train_loss_details['focal'],
+                'train/fft_loss': avg_train_loss_details['fft'],
+
+                # Valid loss components
+                'valid/l1_loss': avg_valid_loss_details['l1'],
+                'valid/ssim_loss': avg_valid_loss_details['ssim'],
+                'valid/perceptual_loss': avg_valid_loss_details['perceptual'],
+                'valid/gradient_loss': avg_valid_loss_details['gradient'],
+                'valid/focal_loss': avg_valid_loss_details['focal'],
+                'valid/fft_loss': avg_valid_loss_details['fft'],
             }
 
             # Log images
