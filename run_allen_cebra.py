@@ -150,8 +150,18 @@ def train_cebra_model(config, train_dataset):
     # TODO: Support multi-session training
     session_data = train_dataset.get_session_data(train_dataset.session_ids[0])
 
-    # Extract neural data
-    neural_data = session_data.patches.obj.cpu().numpy()
+    # Print available attributes to understand data structure
+    print(f"Session data attributes: {session_data.keys}")
+
+    # Extract neural data - Allen dataset uses calcium_traces attribute
+    if hasattr(session_data, 'calcium_traces'):
+        neural_data = session_data.calcium_traces.obj.cpu().numpy()
+        print(f"Using calcium_traces data")
+    elif hasattr(session_data, 'patches'):
+        neural_data = session_data.patches.obj.cpu().numpy()
+        print(f"Using patches data")
+    else:
+        raise AttributeError(f"No suitable neural data found. Available attributes: {session_data.keys}")
 
     print(f"Neural data shape: {neural_data.shape}")
 
