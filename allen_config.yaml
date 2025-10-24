@@ -84,6 +84,19 @@ training:
     enabled: true
     frequency: 5  # Validate every N epochs
 
+# HalfUNet Decoder Configuration
+decoder:
+  latent_dim: 1024  # Latent dimension for HalfUNet
+  learning_rate: 0.001
+  num_epochs: 50
+  batch_size: 32
+
+  # Loss weights
+  loss_weights:
+    mse: 1.0
+    ssim: 0.5
+    multiscale: 0.3
+
 # Output Configuration
 output:
   save_dir: "results"
@@ -99,3 +112,9 @@ output:
 # Reproducibility
 seed: 42
 deterministic: true
+
+# Small model flag for testing
+small_model: false
+
+# SSL mode for cell type selection
+ssl_mode: "predictable"  # Options: predictable, inhibitory, unpredictable, mixed

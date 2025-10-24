@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Main script to train CEBRA on Allen Brain Observatory data
-with poyo-ssl style self-supervised learning
+and decode natural movie frames using HalfUNet
 
 Usage:
     python run_allen_cebra.py --config allen_config.yaml
@@ -13,10 +13,25 @@ import yaml
 import h5py
 import numpy as np
 import torch
+import torch.nn as nn
 from pathlib import Path
 import matplotlib.pyplot as plt
 from datetime import datetime
 import json
+from tqdm import tqdm
+
+# Import kirby modules
+from kirby.data.dataset import Dataset as KirbyDataset
+from kirby.nn.loss import compute_loss_or_metric, SSIMLoss, MultiScaleLoss
+from kirby.nn.unet import HalfUNet
+
+# Import CEBRA
+try:
+    import cebra
+    CEBRA_AVAILABLE = True
+except ImportError:
+    CEBRA_AVAILABLE = False
+    print("Warning: CEBRA not available")
 
 def set_seed(seed):
     """Set random seed for reproducibility"""
@@ -32,255 +47,301 @@ def load_config(config_path):
         config = yaml.safe_load(f)
     return config
 
-def load_allen_session(h5_path, split='train', normalize=True):
+def create_kirby_dataset(config, split='train'):
     """
-    Load Allen Brain Observatory session data
-
-    Args:
-        h5_path: Path to h5 file
-        split: 'train', 'valid', or 'test'
-        normalize: Apply z-score normalization
-
-    Returns:
-        dict with neural_data, timestamps, metadata
-    """
-    print(f"   Loading {h5_path.name} ({split} split)...")
-
-    with h5py.File(h5_path, 'r') as f:
-        # Load calcium traces
-        df_over_f = f['calcium_traces/df_over_f'][:]
-
-        # Load mask
-        mask = f[f'calcium_traces/{split}_mask'][:]
-
-        # Apply mask
-        neural_data = df_over_f[mask]
-
-        # Normalize if requested
-        if normalize:
-            mean = neural_data.mean(axis=0, keepdims=True)
-            std = neural_data.std(axis=0, keepdims=True)
-            std[std == 0] = 1  # Avoid division by zero
-            neural_data = (neural_data - mean) / std
-
-        # Get timestamps
-        if 'calcium_traces/domain/start' in f and 'calcium_traces/domain/end' in f:
-            domain_start = f['calcium_traces/domain/start'][0]
-            domain_end = f['calcium_traces/domain/end'][0]
-            all_timestamps = np.linspace(domain_start, domain_end, len(df_over_f))
-            timestamps = all_timestamps[mask]
-        else:
-            timestamps = np.arange(len(neural_data)).astype(np.float32)
-
-        # Normalize timestamps to [0, 1]
-        timestamps = (timestamps - timestamps.min()) / (timestamps.max() - timestamps.min())
-
-        metadata = {
-            'session_id': h5_path.stem,
-            'split': split,
-            'num_timepoints': neural_data.shape[0],
-            'num_neurons': neural_data.shape[1],
-        }
-
-        print(f"      Shape: {neural_data.shape}, Range: [{neural_data.min():.4f}, {neural_data.max():.4f}]")
-
-        return {
-            'neural_data': neural_data,
-            'timestamps': timestamps,
-            'metadata': metadata
-        }
-
-def load_dataset(config, split='train'):
-    """
-    Load complete dataset from multiple sessions
+    Create Kirby Dataset for Allen Brain Observatory
 
     Args:
         config: Configuration dictionary
         split: 'train', 'valid', or 'test'
 
     Returns:
-        List of data dictionaries
+        KirbyDataset instance
     """
     print(f"\n{'='*80}")
-    print(f"Loading {split} dataset")
+    print(f"Creating Kirby Dataset ({split} split)")
     print(f"{'='*80}")
 
-    data_dir = Path(config['dataset']['data_dir'])
-    h5_files = sorted(data_dir.glob(config['dataset']['file_pattern']))
+    # Prepare include configuration
+    include = [{
+        'selection': [{
+            'dandiset': 'allen_brain_observatory_calcium'
+        }]
+    }]
 
-    max_sessions = config['dataset']['sessions'].get('max_sessions', None)
-    if max_sessions is not None:
-        h5_files = h5_files[:max_sessions]
+    # Create dataset
+    dataset = KirbyDataset(
+        root=config['dataset']['data_dir'],
+        split=split,
+        include=include,
+        transform=None,
+        pretrain=False,
+        finetune=False,
+        small_model=config.get('small_model', False),
+        task='movie_decoding_one',  # natural movie one
+        ssl_mode=config.get('ssl_mode', 'predictable'),
+        model_dim=config['model']['output_dimension']
+    )
 
-    print(f"Found {len(h5_files)} sessions")
+    print(f"✅ Dataset created with {len(dataset)} sessions")
+    return dataset
 
-    all_data = []
-    for h5_file in h5_files:
-        try:
-            data = load_allen_session(
-                h5_file,
-                split=split,
-                normalize=config['dataset']['neural'].get('normalize', True)
-            )
-            all_data.append(data)
-        except Exception as e:
-            print(f"   ⚠️  Error loading {h5_file.name}: {e}")
-
-    print(f"\n✅ Loaded {len(all_data)} sessions")
-    total_neurons = sum(d['metadata']['num_neurons'] for d in all_data)
-    total_timepoints = sum(d['metadata']['num_timepoints'] for d in all_data)
-    print(f"   Total neurons: {total_neurons}")
-    print(f"   Total timepoints: {total_timepoints}")
-
-    return all_data
-
-def create_pytorch_dataset(data_list, mode='separate'):
+def train_cebra_model(config, train_dataset):
     """
-    Create PyTorch dataset from list of session data
-
-    Args:
-        data_list: List of data dictionaries
-        mode: 'separate' - keep sessions separate (for multi-session CEBRA)
-              'pad' - pad to max neurons and concatenate
-              'first_only' - use only first session
-
-    Returns:
-        List of (neural_tensor, time_tensor) tuples for each session
-    """
-    if mode == 'separate':
-        # Keep sessions separate for multi-session training
-        datasets = []
-        for data in data_list:
-            neural_tensor = torch.from_numpy(data['neural_data']).float()
-            time_tensor = torch.from_numpy(data['timestamps']).float()
-            datasets.append((neural_tensor, time_tensor))
-        return datasets
-
-    elif mode == 'pad':
-        # Pad all sessions to have same number of neurons
-        max_neurons = max(d['neural_data'].shape[1] for d in data_list)
-
-        padded_neural = []
-        all_timestamps = []
-
-        for data in data_list:
-            neural = data['neural_data']
-            n_neurons = neural.shape[1]
-
-            if n_neurons < max_neurons:
-                # Pad with zeros
-                padding = np.zeros((neural.shape[0], max_neurons - n_neurons))
-                neural = np.concatenate([neural, padding], axis=1)
-
-            padded_neural.append(neural)
-            all_timestamps.append(data['timestamps'])
-
-        # Concatenate all sessions
-        all_neural = np.concatenate(padded_neural, axis=0)
-        all_timestamps = np.concatenate(all_timestamps, axis=0)
-
-        neural_tensor = torch.from_numpy(all_neural).float()
-        time_tensor = torch.from_numpy(all_timestamps).float()
-
-        return [(neural_tensor, time_tensor)]
-
-    elif mode == 'first_only':
-        # Use only first session
-        data = data_list[0]
-        neural_tensor = torch.from_numpy(data['neural_data']).float()
-        time_tensor = torch.from_numpy(data['timestamps']).float()
-        return [(neural_tensor, time_tensor)]
-
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-def train_model(config, train_data, valid_data=None, mode='separate'):
-    """
-    Train CEBRA model
+    Train CEBRA model on neural data
 
     Args:
         config: Configuration dictionary
-        train_data: Training data list
-        valid_data: Validation data list (optional)
-        mode: 'separate', 'pad', or 'first_only'
+        train_dataset: Training dataset
 
     Returns:
-        Trained model
+        Trained CEBRA model
     """
+    if not CEBRA_AVAILABLE:
+        raise ImportError("CEBRA is not available. Please install it.")
+
     print(f"\n{'='*80}")
     print("Training CEBRA Model")
     print(f"{'='*80}")
 
-    # Create PyTorch datasets
-    print(f"\nPreparing training data (mode={mode})...")
-    train_datasets = create_pytorch_dataset(train_data, mode=mode)
+    # Get first session data for training
+    # TODO: Support multi-session training
+    session_data = train_dataset.get_session_data(train_dataset.session_ids[0])
 
-    print(f"   Number of training sessions: {len(train_datasets)}")
-    for i, (neural, time) in enumerate(train_datasets):
-        print(f"   Session {i+1}: neural={neural.shape}, time={time.shape}")
+    # Extract neural data
+    neural_data = session_data.patches.obj.cpu().numpy()
 
-    if valid_data is not None:
-        print(f"\nPreparing validation data (mode={mode})...")
-        valid_datasets = create_pytorch_dataset(valid_data, mode=mode)
-        print(f"   Number of validation sessions: {len(valid_datasets)}")
-        for i, (neural, time) in enumerate(valid_datasets):
-            print(f"   Session {i+1}: neural={neural.shape}, time={time.shape}")
+    print(f"Neural data shape: {neural_data.shape}")
 
-    # Create simple model placeholder
-    # Note: Full CEBRA integration would require importing CEBRA properly
-    print("\n" + "="*80)
-    print("Model Training Configuration")
-    print("="*80)
-    print(f"   Architecture: {config['model']['architecture']}")
-    print(f"   Batch size: {config['model']['batch_size']}")
-    print(f"   Learning rate: {config['model']['learning_rate']}")
-    print(f"   Max iterations: {config['model']['max_iterations']}")
-    print(f"   Output dimension: {config['model']['output_dimension']}")
+    # Initialize CEBRA model
+    cebra_model = cebra.CEBRA(
+        model_architecture=config['model']['model_architecture'],
+        batch_size=config['model']['batch_size'],
+        learning_rate=config['model']['learning_rate'],
+        max_iterations=config['model']['max_iterations'],
+        output_dimension=config['model']['output_dimension'],
+        device=config['model']['device'],
+        verbose=config['model']['verbose'],
+    )
 
-    print("\n⚠️  Note: This is a data loading test.")
-    print("   For full CEBRA training, ensure all dependencies are installed:")
-    print("   - literate_dataclasses")
-    print("   - cebra package with all dependencies")
+    print("Training CEBRA model...")
+    cebra_model.fit(neural_data)
+    print("✅ CEBRA training complete!")
 
-    # Mock training loop for demonstration
-    print("\n" + "="*80)
-    print("Mock Training Loop")
-    print("="*80)
+    return cebra_model
 
-    batch_size = config['model']['batch_size']
-
-    # Process each session
-    for session_idx, (train_neural, train_time) in enumerate(train_datasets):
-        num_batches = len(train_neural) // batch_size
-
-        print(f"\n   Session {session_idx + 1}:")
-        print(f"      Total samples: {len(train_neural)}")
-        print(f"      Batch size: {batch_size}")
-        print(f"      Number of batches per epoch: {num_batches}")
-
-        # Simulate a few batches
-        print(f"      Simulating first 3 batches:")
-        for i in range(min(3, num_batches)):
-            start_idx = i * batch_size
-            end_idx = start_idx + batch_size
-
-            batch_neural = train_neural[start_idx:end_idx]
-            batch_time = train_time[start_idx:end_idx]
-
-            print(f"         Batch {i+1}: neural={batch_neural.shape}, time={batch_time.shape}")
-
-    return {
-        'train_datasets': train_datasets,
-        'valid_datasets': valid_datasets if valid_data is not None else None,
-        'config': config
-    }
-
-def save_results(model_dict, config):
+def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, device='cuda'):
     """
-    Save model and results
+    Train HalfUNet decoder to reconstruct movie frames from CEBRA embeddings
 
     Args:
-        model_dict: Dictionary containing model and data
+        config: Configuration dictionary
+        cebra_model: Trained CEBRA model
+        train_dataset: Training dataset
+        valid_dataset: Validation dataset
+        device: Device to use for training
+
+    Returns:
+        Trained HalfUNet decoder
+    """
+    print(f"\n{'='*80}")
+    print("Training HalfUNet Decoder")
+    print(f"{'='*80}")
+
+    # Determine output shape based on model dimension
+    model_dim = config['model']['output_dimension']
+    if model_dim <= 512:
+        output_shape = (64, 128)
+    else:
+        output_shape = (128, 256)
+
+    print(f"Output shape: {output_shape}")
+
+    # Initialize HalfUNet
+    decoder = HalfUNet(
+        input_dim=model_dim,
+        output_channels=1,  # Grayscale movie frames
+        output_shape=output_shape,
+        latent_dim=config.get('decoder', {}).get('latent_dim', 1024)
+    ).to(device)
+
+    # Loss functions
+    ssim_loss = SSIMLoss()
+    mse_loss = nn.MSELoss()
+    multiscale_loss = MultiScaleLoss(loss_type='l1', scales=[1.0, 0.5, 0.25])
+
+    # Optimizer
+    optimizer = torch.optim.Adam(
+        decoder.parameters(),
+        lr=config.get('decoder', {}).get('learning_rate', 0.001)
+    )
+
+    # Training parameters
+    num_epochs = config.get('decoder', {}).get('num_epochs', 50)
+    batch_size = config.get('decoder', {}).get('batch_size', 32)
+
+    print(f"Training parameters:")
+    print(f"  Epochs: {num_epochs}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Learning rate: {optimizer.param_groups[0]['lr']}")
+
+    # Training loop
+    best_valid_loss = float('inf')
+
+    for epoch in range(num_epochs):
+        decoder.train()
+        train_losses = []
+
+        # Training phase
+        for session_id in tqdm(train_dataset.session_ids, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            try:
+                session_data = train_dataset.get_session_data(session_id)
+
+                # Get neural data and movie frames
+                neural_data = session_data.patches.obj.cpu().numpy()
+                movie_frames = session_data.movie_frames  # Shape: (T, H, W)
+
+                # Generate CEBRA embeddings
+                embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
+
+                # Prepare movie frames
+                targets = movie_frames.unsqueeze(1).float().to(device)  # Add channel dim
+
+                # Mini-batch training
+                num_samples = len(embeddings)
+                indices = torch.randperm(num_samples)
+
+                for i in range(0, num_samples, batch_size):
+                    batch_indices = indices[i:i+batch_size]
+                    batch_embeddings = embeddings[batch_indices]
+                    batch_targets = targets[batch_indices]
+
+                    # Forward pass
+                    predictions = decoder(batch_embeddings)
+
+                    # Compute loss (combination of losses)
+                    loss_mse = mse_loss(predictions, batch_targets)
+                    loss_ssim = ssim_loss(predictions, batch_targets)
+                    loss_multiscale = multiscale_loss(predictions, batch_targets)
+
+                    total_loss = loss_mse + 0.5 * loss_ssim + 0.3 * loss_multiscale
+
+                    # Backward pass
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    optimizer.step()
+
+                    train_losses.append(total_loss.item())
+
+            except Exception as e:
+                print(f"Warning: Error processing session {session_id}: {e}")
+                continue
+
+        avg_train_loss = np.mean(train_losses) if train_losses else float('inf')
+
+        # Validation phase
+        decoder.eval()
+        valid_losses = []
+
+        with torch.no_grad():
+            for session_id in valid_dataset.session_ids:
+                try:
+                    session_data = valid_dataset.get_session_data(session_id)
+
+                    neural_data = session_data.patches.obj.cpu().numpy()
+                    movie_frames = session_data.movie_frames
+
+                    embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
+                    targets = movie_frames.unsqueeze(1).float().to(device)
+
+                    predictions = decoder(embeddings)
+
+                    loss_mse = mse_loss(predictions, targets)
+                    loss_ssim = ssim_loss(predictions, targets)
+
+                    total_loss = loss_mse + 0.5 * loss_ssim
+                    valid_losses.append(total_loss.item())
+
+                except Exception as e:
+                    continue
+
+        avg_valid_loss = np.mean(valid_losses) if valid_losses else float('inf')
+
+        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}, Valid Loss: {avg_valid_loss:.4f}")
+
+        # Save best model
+        if avg_valid_loss < best_valid_loss:
+            best_valid_loss = avg_valid_loss
+            print(f"  ✅ New best model saved!")
+
+    print("✅ HalfUNet training complete!")
+    return decoder
+
+def visualize_results(decoder, cebra_model, test_dataset, output_dir, device='cuda', num_samples=5):
+    """
+    Visualize reconstruction results
+
+    Args:
+        decoder: Trained HalfUNet decoder
+        cebra_model: Trained CEBRA model
+        test_dataset: Test dataset
+        output_dir: Output directory for visualizations
+        device: Device to use
+        num_samples: Number of samples to visualize
+    """
+    print(f"\n{'='*80}")
+    print("Visualizing Results")
+    print(f"{'='*80}")
+
+    decoder.eval()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    with torch.no_grad():
+        # Get first test session
+        session_id = test_dataset.session_ids[0]
+        session_data = test_dataset.get_session_data(session_id)
+
+        neural_data = session_data.patches.obj.cpu().numpy()
+        movie_frames = session_data.movie_frames
+
+        # Generate embeddings and predictions
+        embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
+        predictions = decoder(embeddings).cpu()
+
+        # Select random samples
+        indices = np.random.choice(len(predictions), size=min(num_samples, len(predictions)), replace=False)
+
+        # Create visualization
+        fig, axes = plt.subplots(num_samples, 2, figsize=(10, num_samples * 3))
+
+        for i, idx in enumerate(indices):
+            # Original frame
+            axes[i, 0].imshow(movie_frames[idx].cpu().numpy(), cmap='gray')
+            axes[i, 0].set_title(f'Original Frame {idx}')
+            axes[i, 0].axis('off')
+
+            # Reconstructed frame
+            axes[i, 1].imshow(predictions[idx, 0].numpy(), cmap='gray')
+            axes[i, 1].set_title(f'Reconstructed Frame {idx}')
+            axes[i, 1].axis('off')
+
+        plt.tight_layout()
+        save_path = output_dir / 'reconstruction_samples.png'
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        print(f"✅ Visualization saved to {save_path}")
+
+    return save_path
+
+def save_results(cebra_model, decoder, config):
+    """
+    Save trained models and results
+
+    Args:
+        cebra_model: Trained CEBRA model
+        decoder: Trained HalfUNet decoder
         config: Configuration dictionary
     """
     print(f"\n{'='*80}")
@@ -298,13 +359,22 @@ def save_results(model_dict, config):
         yaml.dump(config, f)
     print(f"   ✅ Saved config to {config_path}")
 
-    # Save data info
-    train_shapes = [(neural.shape[0], neural.shape[1]) for neural, _ in model_dict['train_datasets']]
+    # Save CEBRA model
+    cebra_path = output_dir / f"cebra_model_{timestamp}.pt"
+    cebra_model.save(str(cebra_path))
+    print(f"   ✅ Saved CEBRA model to {cebra_path}")
 
+    # Save HalfUNet decoder
+    decoder_path = output_dir / f"halfunet_decoder_{timestamp}.pt"
+    torch.save(decoder.state_dict(), decoder_path)
+    print(f"   ✅ Saved HalfUNet decoder to {decoder_path}")
+
+    # Save metadata
     info = {
         'timestamp': timestamp,
-        'num_sessions': len(model_dict['train_datasets']),
-        'train_shapes': train_shapes,
+        'cebra_output_dim': config['model']['output_dimension'],
+        'decoder_latent_dim': config.get('decoder', {}).get('latent_dim', 1024),
+        'task': 'movie_decoding_one',
         'config': config,
     }
 
@@ -318,7 +388,7 @@ def save_results(model_dict, config):
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(
-        description="Train CEBRA on Allen Brain Observatory data"
+        description="Train CEBRA + HalfUNet on Allen Brain Observatory for movie decoding"
     )
     parser.add_argument(
         '--config',
@@ -333,23 +403,28 @@ def main():
         help='Override data directory from config'
     )
     parser.add_argument(
-        '--batch_size',
-        type=int,
-        default=None,
-        help='Override batch size from config'
+        '--device',
+        type=str,
+        default='cuda',
+        help='Device to use (cuda or cpu)'
     )
     parser.add_argument(
-        '--max_sessions',
-        type=int,
+        '--skip_cebra',
+        action='store_true',
+        help='Skip CEBRA training (use existing model)'
+    )
+    parser.add_argument(
+        '--cebra_model_path',
+        type=str,
         default=None,
-        help='Override max sessions from config'
+        help='Path to existing CEBRA model'
     )
 
     args = parser.parse_args()
 
     # Load configuration
     print("\n" + "="*80)
-    print("Allen Brain Observatory - CEBRA Training")
+    print("Allen Brain Observatory - CEBRA + HalfUNet Movie Decoding")
     print("="*80)
     print(f"\nLoading config from: {args.config}")
 
@@ -358,35 +433,58 @@ def main():
     # Override with command line arguments
     if args.data_dir is not None:
         config['dataset']['data_dir'] = args.data_dir
-    if args.batch_size is not None:
-        config['model']['batch_size'] = args.batch_size
-        config['dataloader']['batch_size'] = args.batch_size
-    if args.max_sessions is not None:
-        config['dataset']['sessions']['max_sessions'] = args.max_sessions
+
+    # Set device
+    device = args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu'
+    print(f"Using device: {device}")
 
     # Set seed for reproducibility
     if config.get('seed') is not None:
         print(f"Setting seed to {config['seed']}")
         set_seed(config['seed'])
 
-    # Load datasets
-    train_data = load_dataset(config, split='train')
-    valid_data = load_dataset(config, split='valid')
+    # Create datasets using Kirby
+    train_dataset = create_kirby_dataset(config, split='train')
+    valid_dataset = create_kirby_dataset(config, split='valid')
+    test_dataset = create_kirby_dataset(config, split='test')
 
-    # Train model
-    model_dict = train_model(config, train_data, valid_data)
+    # Train or load CEBRA model
+    if args.skip_cebra and args.cebra_model_path:
+        print(f"\nLoading existing CEBRA model from {args.cebra_model_path}")
+        cebra_model = cebra.CEBRA.load(args.cebra_model_path)
+    else:
+        cebra_model = train_cebra_model(config, train_dataset)
+
+    # Train HalfUNet decoder
+    decoder = train_halfunet_decoder(
+        config,
+        cebra_model,
+        train_dataset,
+        valid_dataset,
+        device=device
+    )
+
+    # Visualize results
+    visualize_results(
+        decoder,
+        cebra_model,
+        test_dataset,
+        config['output']['save_dir'],
+        device=device
+    )
 
     # Save results
-    save_results(model_dict, config)
+    save_results(cebra_model, decoder, config)
 
     print("\n" + "="*80)
     print("✅ All Done!")
     print("="*80)
-    print("\nNext steps:")
-    print("1. Install full CEBRA dependencies if needed")
-    print("2. Integrate with actual CEBRA model training")
-    print("3. Run on GPU for faster training")
-    print(f"4. Results saved to {config['output']['save_dir']}/")
+    print("\nResults:")
+    print(f"1. Models saved to {config['output']['save_dir']}/")
+    print(f"2. Visualizations saved to {config['output']['save_dir']}/")
+    print("\nTo use the trained models:")
+    print("  - Load CEBRA model: cebra.CEBRA.load('path/to/cebra_model.pt')")
+    print("  - Load decoder: decoder.load_state_dict(torch.load('path/to/decoder.pt'))")
     print()
 
 if __name__ == "__main__":
