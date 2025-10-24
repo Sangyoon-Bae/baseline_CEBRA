@@ -155,10 +155,49 @@ def train_cebra_model(config, train_dataset):
 
     # Extract neural data - Allen dataset uses calcium_traces attribute
     if hasattr(session_data, 'calcium_traces'):
-        neural_data = session_data.calcium_traces.obj.cpu().numpy()
+        calcium_traces = session_data.calcium_traces
+        print(f"\nCalcium traces type: {type(calcium_traces)}")
+        print(f"Calcium traces attributes (keys): {calcium_traces.keys}")
+
+        # Check which attribute contains the actual neural data
+        for key in calcium_traces.keys:
+            attr = getattr(calcium_traces, key)
+            print(f"  - {key}: type={type(attr)}, shape={getattr(attr, 'shape', 'N/A')}")
+
+        # Try to get the neural data from the most likely attributes
+        if hasattr(calcium_traces, 'df_over_f'):
+            neural_data_raw = calcium_traces.df_over_f
+            print(f"\nFound df_over_f attribute")
+        elif hasattr(calcium_traces, 'data'):
+            neural_data_raw = calcium_traces.data
+            print(f"\nFound data attribute")
+        elif len(calcium_traces.keys) > 0:
+            # Use the first non-timestamp attribute
+            data_key = [k for k in calcium_traces.keys if 'timestamp' not in k.lower()][0]
+            neural_data_raw = getattr(calcium_traces, data_key)
+            print(f"\nUsing attribute: {data_key}")
+        else:
+            raise AttributeError(f"Cannot find neural data in calcium_traces. Keys: {calcium_traces.keys}")
+
+        # Convert to numpy if it's a torch tensor
+        if hasattr(neural_data_raw, 'cpu'):
+            neural_data = neural_data_raw.cpu().numpy()
+        elif hasattr(neural_data_raw, 'numpy'):
+            neural_data = neural_data_raw.numpy()
+        else:
+            neural_data = neural_data_raw
+
         print(f"Using calcium_traces data")
+
     elif hasattr(session_data, 'patches'):
-        neural_data = session_data.patches.obj.cpu().numpy()
+        patches = session_data.patches
+        print(f"\nPatches type: {type(patches)}")
+
+        if hasattr(patches, 'obj'):
+            neural_data = patches.obj.cpu().numpy()
+        else:
+            # Assume patches itself is the data
+            neural_data = patches if isinstance(patches, np.ndarray) else patches.cpu().numpy()
         print(f"Using patches data")
     else:
         raise AttributeError(f"No suitable neural data found. Available attributes: {session_data.keys}")
