@@ -86,7 +86,8 @@ training:
 
 # HalfUNet Decoder Configuration
 decoder:
-  latent_dim: 1024  # Latent dimension for HalfUNet
+  # Note: latent_dim is now automatically set to match CEBRA output_dimension
+  # No need to specify latent_dim separately in two-stage training
   learning_rate: 0.001
   num_epochs: 25
   batch_size: 32

@@ -134,53 +134,58 @@ def create_kirby_dataset(config, split='train'):
     print(f"✅ Dataset created with {len(dataset)} sessions")
     return dataset
 
-def initialize_cebra_model(config, train_dataset, device='cuda'):
+def train_cebra_per_session(config, dataset, split='train', device='cuda'):
     """
-    Initialize CEBRA model with minimal training to set up solver
+    Train CEBRA model separately for each session (to handle different neuron counts)
 
     Args:
         config: Configuration dictionary
-        train_dataset: Training dataset (to get sample data for initialization)
+        dataset: Dataset object
+        split: 'train', 'valid', or 'test'
         device: Device to use
 
     Returns:
-        Initialized CEBRA model with solver ready
+        Dictionary mapping session_id to trained CEBRA model
     """
     if not CEBRA_AVAILABLE:
         raise ImportError("CEBRA is not available. Please install it.")
 
     print(f"\n{'='*80}")
-    print("Initializing CEBRA Model")
+    print(f"Training CEBRA Models Per Session ({split} split)")
     print(f"{'='*80}")
 
-    # Get first session data for initialization
-    session_data = train_dataset.get_session_data(train_dataset.session_ids[0])
-    neural_data = extract_neural_data(session_data)
+    session_cebra_models = {}
 
-    print(f"Using sample data shape: {neural_data.shape} for CEBRA initialization")
+    for session_id in tqdm(dataset.session_ids, desc=f"Training CEBRA ({split})"):
+        try:
+            session_data = dataset.get_session_data(session_id)
+            neural_data = extract_neural_data(session_data)
 
-    # Initialize CEBRA model
-    cebra_model = cebra.CEBRA(
-        model_architecture=config['model']['model_architecture'],
-        batch_size=config['model']['batch_size'],
-        learning_rate=config['model']['learning_rate'],
-        max_iterations=10,  # Just a few iterations to initialize solver
-        output_dimension=config['model']['output_dimension'],
-        device=device if device != 'cpu' else 'cpu',
-        verbose=False,  # Don't show progress for initialization
-    )
+            print(f"\n  Session {session_id}: {neural_data.shape}")
 
-    # Fit with minimal iterations to initialize the solver
-    print("Initializing CEBRA solver (10 iterations)...")
-    cebra_model.fit(neural_data)
+            # Create and train CEBRA model for this session
+            cebra_model = cebra.CEBRA(
+                model_architecture=config['model']['model_architecture'],
+                batch_size=config['model']['batch_size'],
+                learning_rate=config['model']['learning_rate'],
+                max_iterations=config['model']['max_iterations'],
+                output_dimension=config['model']['output_dimension'],
+                device=device if device != 'cpu' else 'cpu',
+                verbose=False,
+            )
 
-    # Now reset max_iterations for actual joint training
-    cebra_model.max_iterations = config['model']['max_iterations']
-    cebra_model.verbose = config['model']['verbose']
+            # Train on this session
+            cebra_model.fit(neural_data)
 
-    print("✅ CEBRA model initialized with solver ready for joint training")
+            session_cebra_models[session_id] = cebra_model
+            print(f"  ✅ CEBRA trained for session {session_id}")
 
-    return cebra_model
+        except Exception as e:
+            print(f"  ⚠️  Error training CEBRA for session {session_id}: {e}")
+            continue
+
+    print(f"\n✅ Trained CEBRA for {len(session_cebra_models)} sessions")
+    return session_cebra_models
 
 def extract_neural_data(session_data):
     """
@@ -271,44 +276,36 @@ def extract_movie_frames(session_data, dataset):
 
     raise AttributeError(f"Cannot extract movie frames. Available attributes: {session_data.keys}")
 
-def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device='cuda', wandb_run=None):
+def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dataset, valid_dataset, device='cuda', wandb_run=None):
     """
-    Train CEBRA and HalfUNet jointly end-to-end
+    Train HalfUNet decoder using pre-trained CEBRA embeddings
 
-    This enables the decoder loss to guide CEBRA's representation learning,
-    creating embeddings optimized for movie frame reconstruction.
+    Two-stage approach:
+    Stage 1: Train CEBRA per session (handles different neuron counts)
+    Stage 2: Train HalfUNet decoder on embeddings (all same dimension)
 
     Args:
         config: Configuration dictionary
-        cebra_model: Initialized (untrained) CEBRA model
+        train_cebra_models: Dictionary of session_id -> trained CEBRA model (train)
+        valid_cebra_models: Dictionary of session_id -> trained CEBRA model (valid)
         train_dataset: Training dataset
         valid_dataset: Validation dataset
         device: Device to use for training
         wandb_run: Weights & Biases run object for logging
 
     Returns:
-        Tuple of (trained CEBRA model, trained HalfUNet decoder)
+        Trained HalfUNet decoder
     """
     print(f"\n{'='*80}")
-    print("Joint Training: CEBRA + HalfUNet Decoder")
+    print("Stage 2: Training HalfUNet Decoder")
     print(f"{'='*80}")
-    print("Training both models end-to-end for optimized reconstruction")
+    print("Using pre-trained CEBRA embeddings for decoder training")
 
-    # Determine output shape based on model dimension
-    model_dim = config['model']['output_dimension']
-    if model_dim <= 512:
-        output_shape = (64, 128)
-    else:
-        output_shape = (128, 256)
-
-    print(f"Output shape: {output_shape}")
-
-    # Initialize HalfUNet
-    # HalfUNet expects: in_channels, out_channels, latent_dim
+    # Initialize HalfUNet decoder
     decoder = HalfUNet(
         in_channels=1,
         out_channels=1,  # Grayscale movie frames
-        latent_dim=config.get('decoder', {}).get('latent_dim', 1024)
+        latent_dim=config['model']['output_dimension']  # Same as CEBRA output dim
     ).to(device)
 
     # Loss functions (6 losses as specified)
@@ -337,36 +334,15 @@ def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device=
     print(f"  Focal Loss (weight: {loss_weights['focal']})")
     print(f"  FFT Loss (weight: {loss_weights['fft']})")
 
-    # Get CEBRA's internal PyTorch model
-    # CEBRA wraps a PyTorch model in its solver_
-    if hasattr(cebra_model, 'solver_') and cebra_model.solver_ is not None:
-        if hasattr(cebra_model.solver_, 'model'):
-            cebra_net = cebra_model.solver_.model
-        else:
-            cebra_net = cebra_model.solver_
-    elif hasattr(cebra_model, 'model'):
-        cebra_net = cebra_model.model
-    else:
-        raise AttributeError("Cannot access CEBRA's internal PyTorch model. Make sure CEBRA is initialized.")
-
-    # Move CEBRA network to device
-    cebra_net = cebra_net.to(device)
-
-    print(f"\n✅ CEBRA network extracted for joint training")
-    print(f"   CEBRA network type: {type(cebra_net)}")
-
-    # Joint optimizer for both CEBRA and decoder
-    # Combine parameters from both models
-    all_parameters = list(decoder.parameters())
-    if hasattr(cebra_net, 'parameters'):
-        all_parameters += list(cebra_net.parameters())
-
+    # Optimizer for decoder only (CEBRA is frozen)
     optimizer = torch.optim.Adam(
-        all_parameters,
+        decoder.parameters(),
         lr=config.get('decoder', {}).get('learning_rate', 0.001)
     )
 
-    print(f"Joint optimizer created with {len(all_parameters)} parameter groups")
+    print(f"\nDecoder optimizer created")
+    print(f"  CEBRA models: FROZEN (pre-trained)")
+    print(f"  HalfUNet: TRAINABLE")
 
     # Training parameters
     num_epochs = config.get('decoder', {}).get('num_epochs', 50)
@@ -391,21 +367,22 @@ def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device=
         # Training phase
         for session_id in tqdm(train_dataset.session_ids, desc=f"Epoch {epoch+1}/{num_epochs}"):
             try:
+                # Skip if no CEBRA model for this session
+                if session_id not in train_cebra_models:
+                    continue
+
                 session_data = train_dataset.get_session_data(session_id)
 
                 # Get neural data and movie frames
                 neural_data = extract_neural_data(session_data)
                 movie_frames = extract_movie_frames(session_data, train_dataset)  # Shape: (T, H, W)
 
-                # Convert neural data to torch tensor
-                neural_data_tensor = torch.from_numpy(neural_data).float().to(device)
+                # Get pre-trained CEBRA model for this session
+                cebra_model = train_cebra_models[session_id]
 
-                # Generate CEBRA embeddings using forward pass (keep gradients!)
-                # This allows gradients to flow back to CEBRA
-                cebra_net.train()
-
-                # CEBRA's model.forward() expects the input and returns embeddings
-                embeddings = cebra_net(neural_data_tensor)
+                # Generate embeddings (no gradients - CEBRA is frozen)
+                with torch.no_grad():
+                    embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
 
                 # Prepare movie frames
                 targets = movie_frames.unsqueeze(1).float().to(device)  # Add channel dim
@@ -466,7 +443,6 @@ def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device=
 
         # Validation phase
         decoder.eval()
-        cebra_net.eval()
         valid_losses = []
         valid_loss_details = {
             'l1': [], 'ssim': [], 'perceptual': [],
@@ -480,16 +456,20 @@ def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device=
         with torch.no_grad():
             for idx, session_id in enumerate(valid_dataset.session_ids):
                 try:
+                    # Skip if no CEBRA model for this session
+                    if session_id not in valid_cebra_models:
+                        continue
+
                     session_data = valid_dataset.get_session_data(session_id)
 
                     neural_data = extract_neural_data(session_data)
                     movie_frames = extract_movie_frames(session_data, valid_dataset)
 
-                    # Convert neural data to torch tensor
-                    neural_data_tensor = torch.from_numpy(neural_data).float().to(device)
+                    # Get pre-trained CEBRA model for this session
+                    cebra_model = valid_cebra_models[session_id]
 
-                    # Generate CEBRA embeddings
-                    embeddings = cebra_net(neural_data_tensor)
+                    # Generate embeddings
+                    embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
 
                     targets = movie_frames.unsqueeze(1).float().to(device)
 
@@ -601,17 +581,17 @@ def train_joint_model(config, cebra_model, train_dataset, valid_dataset, device=
             best_valid_loss = avg_valid_loss
             print(f"  ✅ New best model saved!")
 
-    print("✅ Joint training complete!")
-    print("Both CEBRA and HalfUNet have been trained end-to-end")
-    return cebra_model, decoder
+    print("✅ Decoder training complete!")
+    print("HalfUNet decoder has been trained on frozen CEBRA embeddings")
+    return decoder
 
-def visualize_results(decoder, cebra_model, test_dataset, output_dir, device='cuda', num_samples=5):
+def visualize_results(decoder, test_cebra_models, test_dataset, output_dir, device='cuda', num_samples=5):
     """
     Visualize reconstruction results
 
     Args:
         decoder: Trained HalfUNet decoder
-        cebra_model: Trained CEBRA model
+        test_cebra_models: Dictionary of session_id -> trained CEBRA model (test)
         test_dataset: Test dataset
         output_dir: Output directory for visualizations
         device: Device to use
@@ -626,14 +606,24 @@ def visualize_results(decoder, cebra_model, test_dataset, output_dir, device='cu
     output_dir.mkdir(exist_ok=True)
 
     with torch.no_grad():
-        # Get first test session
-        session_id = test_dataset.session_ids[0]
+        # Get first test session with CEBRA model
+        session_id = None
+        for sid in test_dataset.session_ids:
+            if sid in test_cebra_models:
+                session_id = sid
+                break
+
+        if session_id is None:
+            print("⚠️  No test sessions with CEBRA models available")
+            return None
+
         session_data = test_dataset.get_session_data(session_id)
 
         neural_data = extract_neural_data(session_data)
         movie_frames = extract_movie_frames(session_data, test_dataset)
 
         # Generate embeddings and predictions
+        cebra_model = test_cebra_models[session_id]
         embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
         predictions = decoder(embeddings).cpu()
 
@@ -667,12 +657,14 @@ def visualize_results(decoder, cebra_model, test_dataset, output_dir, device='cu
 
     return save_path
 
-def save_results(cebra_model, decoder, config):
+def save_results(train_cebra_models, valid_cebra_models, test_cebra_models, decoder, config):
     """
     Save trained models and results
 
     Args:
-        cebra_model: Trained CEBRA model
+        train_cebra_models: Dictionary of session_id -> trained CEBRA model (train)
+        valid_cebra_models: Dictionary of session_id -> trained CEBRA model (valid)
+        test_cebra_models: Dictionary of session_id -> trained CEBRA model (test)
         decoder: Trained HalfUNet decoder
         config: Configuration dictionary
     """
@@ -691,10 +683,17 @@ def save_results(cebra_model, decoder, config):
         yaml.dump(config, f)
     print(f"   ✅ Saved config to {config_path}")
 
-    # Save CEBRA model
-    cebra_path = output_dir / f"cebra_model_{timestamp}.pt"
-    cebra_model.save(str(cebra_path))
-    print(f"   ✅ Saved CEBRA model to {cebra_path}")
+    # Save CEBRA models per session
+    cebra_dir = output_dir / f"cebra_models_{timestamp}"
+    cebra_dir.mkdir(exist_ok=True)
+
+    for split_name, models_dict in [('train', train_cebra_models), ('valid', valid_cebra_models), ('test', test_cebra_models)]:
+        split_dir = cebra_dir / split_name
+        split_dir.mkdir(exist_ok=True)
+        for session_id, cebra_model in models_dict.items():
+            cebra_path = split_dir / f"cebra_{session_id}.pt"
+            cebra_model.save(str(cebra_path))
+        print(f"   ✅ Saved {len(models_dict)} CEBRA models ({split_name}) to {split_dir}")
 
     # Save HalfUNet decoder
     decoder_path = output_dir / f"halfunet_decoder_{timestamp}.pt"
@@ -705,8 +704,10 @@ def save_results(cebra_model, decoder, config):
     info = {
         'timestamp': timestamp,
         'cebra_output_dim': config['model']['output_dimension'],
-        'decoder_latent_dim': config.get('decoder', {}).get('latent_dim', 1024),
         'task': 'movie_decoding_one',
+        'num_train_sessions': len(train_cebra_models),
+        'num_valid_sessions': len(valid_cebra_models),
+        'num_test_sessions': len(test_cebra_models),
         'config': config,
     }
 
@@ -783,22 +784,30 @@ def main():
     valid_dataset = create_kirby_dataset(config, split='valid')
     test_dataset = create_kirby_dataset(config, split='test')
 
-    # Initialize or load CEBRA model
-    if args.skip_cebra and args.cebra_model_path:
-        print(f"\nLoading existing CEBRA model from {args.cebra_model_path}")
-        cebra_model = cebra.CEBRA.load(args.cebra_model_path)
-        print("Note: Using pre-trained CEBRA. Joint training will still fine-tune it.")
-    else:
-        # Initialize CEBRA model with solver
-        cebra_model = initialize_cebra_model(config, train_dataset, device=device)
-
-    # Joint training: CEBRA + HalfUNet decoder
+    # Stage 1: Train CEBRA per session
     print("\n" + "="*80)
-    print("Starting Joint End-to-End Training")
+    print("Stage 1: Training CEBRA Models Per Session")
     print("="*80)
-    cebra_model, decoder = train_joint_model(
+    print("Each session has different neuron counts - training separate CEBRA models")
+
+    if args.skip_cebra and args.cebra_model_path:
+        print(f"\n⚠️  --skip_cebra not supported in two-stage training")
+        print("   Training CEBRA from scratch for each session...")
+
+    train_cebra_models = train_cebra_per_session(config, train_dataset, split='train', device=device)
+    valid_cebra_models = train_cebra_per_session(config, valid_dataset, split='valid', device=device)
+    test_cebra_models = train_cebra_per_session(config, test_dataset, split='test', device=device)
+
+    # Stage 2: Train HalfUNet decoder
+    print("\n" + "="*80)
+    print("Stage 2: Training HalfUNet Decoder")
+    print("="*80)
+    print("All CEBRA embeddings have same dimension - can train single decoder")
+
+    decoder = train_decoder_only(
         config,
-        cebra_model,
+        train_cebra_models,
+        valid_cebra_models,
         train_dataset,
         valid_dataset,
         device=device,
@@ -808,14 +817,14 @@ def main():
     # Visualize results
     visualize_results(
         decoder,
-        cebra_model,
+        test_cebra_models,
         test_dataset,
         config['output']['save_dir'],
         device=device
     )
 
     # Save results
-    save_results(cebra_model, decoder, config)
+    save_results(train_cebra_models, valid_cebra_models, test_cebra_models, decoder, config)
 
     # Finish wandb run
     if wandb_run is not None:
@@ -826,13 +835,17 @@ def main():
     print("✅ All Done!")
     print("="*80)
     print("\nResults:")
-    print(f"1. Models saved to {config['output']['save_dir']}/")
-    print(f"2. Visualizations saved to {config['output']['save_dir']}/")
+    print(f"1. CEBRA models (per session) saved to {config['output']['save_dir']}/cebra_models_*/")
+    print(f"2. HalfUNet decoder saved to {config['output']['save_dir']}/")
+    print(f"3. Visualizations saved to {config['output']['save_dir']}/")
     if wandb_run is not None:
-        print(f"3. Training logs available at wandb")
+        print(f"4. Training logs available at wandb")
+    print("\nTwo-Stage Training Summary:")
+    print(f"  - Stage 1: Trained {len(train_cebra_models)} CEBRA models (one per session)")
+    print(f"  - Stage 2: Trained single HalfUNet decoder on all embeddings")
     print("\nTo use the trained models:")
-    print("  - Load CEBRA model: cebra.CEBRA.load('path/to/cebra_model.pt')")
-    print("  - Load decoder: decoder.load_state_dict(torch.load('path/to/decoder.pt'))")
+    print("  - Load CEBRA model: cebra.CEBRA.load('path/to/cebra_models_*/train/cebra_SESSION_ID.pt')")
+    print("  - Load decoder: decoder.load_state_dict(torch.load('path/to/halfunet_decoder.pt'))")
     print()
 
 if __name__ == "__main__":
