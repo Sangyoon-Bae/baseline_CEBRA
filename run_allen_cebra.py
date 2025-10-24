@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import json
 from tqdm import tqdm
+import os
 
 # Import kirby modules
 from kirby.data.dataset import Dataset as KirbyDataset
@@ -33,6 +34,14 @@ except ImportError:
     CEBRA_AVAILABLE = False
     print("Warning: CEBRA not available")
 
+# Import wandb
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not available. Install with: pip install wandb")
+
 def set_seed(seed):
     """Set random seed for reproducibility"""
     torch.manual_seed(seed)
@@ -46,6 +55,35 @@ def load_config(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
+
+def init_wandb(config):
+    """Initialize Weights & Biases logging"""
+    if not WANDB_AVAILABLE:
+        print("Warning: wandb not available, skipping wandb initialization")
+        return None
+
+    wandb_config = config.get('wandb', {})
+    if not wandb_config.get('enabled', False):
+        print("wandb is disabled in config")
+        return None
+
+    # Set API key if provided
+    api_key = wandb_config.get('api_key', '').strip()
+    if api_key:
+        os.environ['WANDB_API_KEY'] = api_key
+
+    # Initialize wandb
+    run = wandb.init(
+        entity=wandb_config.get('entity', None) or None,
+        project=wandb_config.get('project', 'allen-cebra-halfunet'),
+        name=wandb_config.get('name', None),
+        notes=wandb_config.get('notes', ''),
+        tags=wandb_config.get('tags', []),
+        config=config
+    )
+
+    print(f"✅ wandb initialized: {run.url}")
+    return run
 
 def create_kirby_dataset(config, split='train'):
     """
@@ -130,7 +168,7 @@ def train_cebra_model(config, train_dataset):
 
     return cebra_model
 
-def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, device='cuda'):
+def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, device='cuda', wandb_run=None):
     """
     Train HalfUNet decoder to reconstruct movie frames from CEBRA embeddings
 
@@ -140,6 +178,7 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
         train_dataset: Training dataset
         valid_dataset: Validation dataset
         device: Device to use for training
+        wandb_run: Weights & Biases run object for logging
 
     Returns:
         Trained HalfUNet decoder
@@ -242,9 +281,14 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
         # Validation phase
         decoder.eval()
         valid_losses = []
+        valid_ssim_scores = []
+
+        # For wandb image logging (save first batch of predictions)
+        first_predictions = None
+        first_targets = None
 
         with torch.no_grad():
-            for session_id in valid_dataset.session_ids:
+            for idx, session_id in enumerate(valid_dataset.session_ids):
                 try:
                     session_data = valid_dataset.get_session_data(session_id)
 
@@ -262,12 +306,52 @@ def train_halfunet_decoder(config, cebra_model, train_dataset, valid_dataset, de
                     total_loss = loss_mse + 0.5 * loss_ssim
                     valid_losses.append(total_loss.item())
 
+                    # Calculate SSIM metric (1 - loss since SSIMLoss returns 1-SSIM)
+                    ssim_score = 1.0 - loss_ssim.item()
+                    valid_ssim_scores.append(ssim_score)
+
+                    # Save first batch for visualization
+                    if idx == 0 and wandb_run is not None:
+                        first_predictions = predictions[:8].detach().cpu()  # Save up to 8 samples
+                        first_targets = targets[:8].detach().cpu()
+
                 except Exception as e:
                     continue
 
         avg_valid_loss = np.mean(valid_losses) if valid_losses else float('inf')
+        avg_valid_ssim = np.mean(valid_ssim_scores) if valid_ssim_scores else 0.0
 
-        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}, Valid Loss: {avg_valid_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}, Valid Loss: {avg_valid_loss:.4f}, Valid SSIM: {avg_valid_ssim:.4f}")
+
+        # Log to wandb
+        if wandb_run is not None:
+            log_dict = {
+                'epoch': epoch + 1,
+                'train_loss': avg_train_loss,
+                'valid_loss': avg_valid_loss,
+                'valid_ssim': avg_valid_ssim,
+            }
+
+            # Log images
+            if first_predictions is not None and first_targets is not None:
+                # Create side-by-side comparison
+                num_images = min(4, len(first_predictions))  # Show up to 4 images
+                images_to_log = []
+
+                for i in range(num_images):
+                    pred_img = first_predictions[i, 0].numpy()  # Remove channel dim
+                    target_img = first_targets[i, 0].numpy()
+
+                    # Stack horizontally: [target | prediction]
+                    comparison = np.hstack([target_img, pred_img])
+                    images_to_log.append(wandb.Image(
+                        comparison,
+                        caption=f"Epoch {epoch+1} - Sample {i+1} (Left: GT, Right: Pred)"
+                    ))
+
+                log_dict['predictions'] = images_to_log
+
+            wandb_run.log(log_dict)
 
         # Save best model
         if avg_valid_loss < best_valid_loss:
@@ -443,6 +527,9 @@ def main():
         print(f"Setting seed to {config['seed']}")
         set_seed(config['seed'])
 
+    # Initialize wandb
+    wandb_run = init_wandb(config)
+
     # Create datasets using Kirby
     train_dataset = create_kirby_dataset(config, split='train')
     valid_dataset = create_kirby_dataset(config, split='valid')
@@ -461,7 +548,8 @@ def main():
         cebra_model,
         train_dataset,
         valid_dataset,
-        device=device
+        device=device,
+        wandb_run=wandb_run
     )
 
     # Visualize results
@@ -476,12 +564,19 @@ def main():
     # Save results
     save_results(cebra_model, decoder, config)
 
+    # Finish wandb run
+    if wandb_run is not None:
+        wandb_run.finish()
+        print("✅ wandb run finished")
+
     print("\n" + "="*80)
     print("✅ All Done!")
     print("="*80)
     print("\nResults:")
     print(f"1. Models saved to {config['output']['save_dir']}/")
     print(f"2. Visualizations saved to {config['output']['save_dir']}/")
+    if wandb_run is not None:
+        print(f"3. Training logs available at wandb")
     print("\nTo use the trained models:")
     print("  - Load CEBRA model: cebra.CEBRA.load('path/to/cebra_model.pt')")
     print("  - Load decoder: decoder.load_state_dict(torch.load('path/to/decoder.pt'))")

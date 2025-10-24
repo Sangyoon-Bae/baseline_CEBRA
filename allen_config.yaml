@@ -109,6 +109,16 @@ output:
     plot_loss: true
     plot_embeddings: true
 
+# Weights & Biases Configuration
+wandb:
+  enabled: true
+  entity: ""  # Enter your wandb entity here
+  api_key: ""  # Enter your wandb API key here
+  project: "allen-cebra-halfunet"
+  name: null  # Run name (null = auto-generated)
+  notes: ""  # Optional notes for this run
+  tags: []  # Optional tags
+
 # Reproducibility
 seed: 42
 deterministic: true
