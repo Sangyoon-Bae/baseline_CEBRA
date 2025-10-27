@@ -32,7 +32,7 @@ dataset:
 # CEBRA Model Configuration (poyo-ssl style)
 model:
   architecture: "offset10-model"
-  output_dimension: 32
+  output_dimension: 1024  # Hidden/embedding dimension
   model_architecture: "offset10-model"
 
   # Self-supervised learning

@@ -14,12 +14,14 @@ import h5py
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.multiprocessing as mp
 from pathlib import Path
 import matplotlib.pyplot as plt
 from datetime import datetime
 import json
 from tqdm import tqdm
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Import kirby modules
 from kirby.data.dataset import Dataset as KirbyDataset
@@ -134,15 +136,57 @@ def create_kirby_dataset(config, split='train'):
     print(f"✅ Dataset created with {len(dataset)} sessions")
     return dataset
 
-def train_cebra_per_session(config, dataset, split='train', device='cuda'):
+def train_single_cebra(session_id, dataset, config, device_id):
+    """
+    Train CEBRA for a single session on a specific GPU
+
+    Args:
+        session_id: Session identifier
+        dataset: Dataset object
+        config: Configuration dictionary
+        device_id: GPU device ID
+
+    Returns:
+        Tuple of (session_id, trained CEBRA model) or (session_id, None) on error
+    """
+    try:
+        device = f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu'
+
+        session_data = dataset.get_session_data(session_id)
+        neural_data = extract_neural_data(session_data)
+
+        # Create and train CEBRA model for this session
+        cebra_model = cebra.CEBRA(
+            model_architecture=config['model']['model_architecture'],
+            batch_size=config['model']['batch_size'],
+            learning_rate=config['model']['learning_rate'],
+            max_iterations=config['model']['max_iterations'],
+            output_dimension=config['model']['output_dimension'],
+            device=device,
+            verbose=False,
+        )
+
+        # Train on this session
+        cebra_model.fit(neural_data)
+
+        return (session_id, cebra_model)
+
+    except Exception as e:
+        print(f"  ⚠️  Error training CEBRA for session {session_id}: {e}")
+        return (session_id, None)
+
+
+def train_cebra_per_session(config, dataset, split='train', device='cuda', num_gpus=None):
     """
     Train CEBRA model separately for each session (to handle different neuron counts)
+    Supports multi-GPU parallel training
 
     Args:
         config: Configuration dictionary
         dataset: Dataset object
         split: 'train', 'valid', or 'test'
-        device: Device to use
+        device: Device to use ('cuda' or 'cpu')
+        num_gpus: Number of GPUs to use (None = use all available, 1 = sequential)
 
     Returns:
         Dictionary mapping session_id to trained CEBRA model
@@ -154,37 +198,63 @@ def train_cebra_per_session(config, dataset, split='train', device='cuda'):
     print(f"Training CEBRA Models Per Session ({split} split)")
     print(f"{'='*80}")
 
+    # Determine number of GPUs to use
+    if device == 'cpu':
+        num_gpus = 0
+    elif num_gpus is None:
+        num_gpus = torch.cuda.device_count()
+
+    num_gpus = max(0, num_gpus)  # Ensure non-negative
+
+    if num_gpus == 0:
+        print("Training on CPU (sequential)")
+    elif num_gpus == 1:
+        print("Training on single GPU (sequential)")
+    else:
+        print(f"Training on {num_gpus} GPUs (parallel)")
+
     session_cebra_models = {}
+    session_ids = dataset.session_ids
 
-    for session_id in tqdm(dataset.session_ids, desc=f"Training CEBRA ({split})"):
-        try:
-            session_data = dataset.get_session_data(session_id)
-            neural_data = extract_neural_data(session_data)
+    # Multi-GPU parallel training
+    if num_gpus > 1:
+        # Distribute sessions across GPUs
+        session_gpu_map = [(sid, i % num_gpus) for i, sid in enumerate(session_ids)]
 
-            print(f"\n  Session {session_id}: {neural_data.shape}")
+        print(f"Distributing {len(session_ids)} sessions across {num_gpus} GPUs...")
 
-            # Create and train CEBRA model for this session
-            cebra_model = cebra.CEBRA(
-                model_architecture=config['model']['model_architecture'],
-                batch_size=config['model']['batch_size'],
-                learning_rate=config['model']['learning_rate'],
-                max_iterations=config['model']['max_iterations'],
-                output_dimension=config['model']['output_dimension'],
-                device=device if device != 'cpu' else 'cpu',
-                verbose=False,
+        # Process sessions in parallel
+        with tqdm(total=len(session_ids), desc=f"Training CEBRA ({split})") as pbar:
+            # Use threading for I/O bound tasks (each GPU handles its own sessions)
+            from concurrent.futures import ThreadPoolExecutor
+
+            def train_on_gpu(session_id, gpu_id):
+                result = train_single_cebra(session_id, dataset, config, gpu_id)
+                pbar.update(1)
+                return result
+
+            with ThreadPoolExecutor(max_workers=num_gpus) as executor:
+                futures = [
+                    executor.submit(train_on_gpu, session_id, gpu_id)
+                    for session_id, gpu_id in session_gpu_map
+                ]
+
+                for future in as_completed(futures):
+                    session_id, cebra_model = future.result()
+                    if cebra_model is not None:
+                        session_cebra_models[session_id] = cebra_model
+
+    # Single GPU or CPU (sequential)
+    else:
+        device_id = 0 if num_gpus == 1 else 'cpu'
+        for session_id in tqdm(session_ids, desc=f"Training CEBRA ({split})"):
+            session_id_result, cebra_model = train_single_cebra(
+                session_id, dataset, config, device_id
             )
+            if cebra_model is not None:
+                session_cebra_models[session_id] = cebra_model
 
-            # Train on this session
-            cebra_model.fit(neural_data)
-
-            session_cebra_models[session_id] = cebra_model
-            print(f"  ✅ CEBRA trained for session {session_id}")
-
-        except Exception as e:
-            print(f"  ⚠️  Error training CEBRA for session {session_id}: {e}")
-            continue
-
-    print(f"\n✅ Trained CEBRA for {len(session_cebra_models)} sessions")
+    print(f"\n✅ Trained CEBRA for {len(session_cebra_models)}/{len(session_ids)} sessions")
     return session_cebra_models
 
 def extract_neural_data(session_data):
@@ -306,7 +376,15 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
         in_channels=1,
         out_channels=1,  # Grayscale movie frames
         latent_dim=config['model']['output_dimension']  # Same as CEBRA output dim
-    ).to(device)
+    )
+
+    # Move to device and enable DataParallel if multiple GPUs available
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print(f"\n🚀 Using DataParallel with {torch.cuda.device_count()} GPUs for HalfUNet")
+        decoder = nn.DataParallel(decoder)
+        decoder = decoder.to(device)
+    else:
+        decoder = decoder.to(device)
 
     # Loss functions (6 losses as specified)
     ssim_loss = SSIMLoss()
@@ -752,6 +830,12 @@ def main():
         default=None,
         help='Path to existing CEBRA model'
     )
+    parser.add_argument(
+        '--num_gpus',
+        type=int,
+        default=None,
+        help='Number of GPUs to use for parallel CEBRA training (None = use all available, 1 = sequential)'
+    )
 
     args = parser.parse_args()
 
@@ -794,9 +878,9 @@ def main():
         print(f"\n⚠️  --skip_cebra not supported in two-stage training")
         print("   Training CEBRA from scratch for each session...")
 
-    train_cebra_models = train_cebra_per_session(config, train_dataset, split='train', device=device)
-    valid_cebra_models = train_cebra_per_session(config, valid_dataset, split='valid', device=device)
-    test_cebra_models = train_cebra_per_session(config, test_dataset, split='test', device=device)
+    train_cebra_models = train_cebra_per_session(config, train_dataset, split='train', device=device, num_gpus=args.num_gpus)
+    valid_cebra_models = train_cebra_per_session(config, valid_dataset, split='valid', device=device, num_gpus=args.num_gpus)
+    test_cebra_models = train_cebra_per_session(config, test_dataset, split='test', device=device, num_gpus=args.num_gpus)
 
     # Stage 2: Train HalfUNet decoder
     print("\n" + "="*80)
