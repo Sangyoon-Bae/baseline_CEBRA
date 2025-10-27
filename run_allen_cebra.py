@@ -93,19 +93,27 @@ def init_wandb(config):
     print(f"✅ wandb initialized: {run.url}")
     return run
 
-def create_kirby_dataset(config, split='train'):
+def create_kirby_dataset(config, split='train', pretrain=False, finetune=False):
     """
     Create Kirby Dataset for Allen Brain Observatory
 
     Args:
         config: Configuration dictionary
         split: 'train', 'valid', or 'test'
+        pretrain: Whether to use pretrain mode (combines all splits)
+        finetune: Whether to use finetune mode (filters specific cell types)
 
     Returns:
         KirbyDataset instance
     """
     print(f"\n{'='*80}")
     print(f"Creating Kirby Dataset ({split} split)")
+    if pretrain:
+        print("  Mode: PRETRAIN (all splits combined)")
+    elif finetune:
+        print("  Mode: FINETUNE (filtered cell types)")
+    else:
+        print("  Mode: FROM SCRATCH")
     print(f"{'='*80}")
 
     # Prepare include configuration
@@ -121,8 +129,8 @@ def create_kirby_dataset(config, split='train'):
         split=split,
         include=include,
         transform=None,
-        pretrain=False,
-        finetune=False,
+        pretrain=pretrain,
+        finetune=finetune,
         small_model=config.get('small_model', False),
         task='movie_decoding_one',  # natural movie one
         ssl_mode=config.get('ssl_mode', 'predictable'),
@@ -836,6 +844,16 @@ def main():
         default=None,
         help='Number of GPUs to use for parallel CEBRA training (None = use all available, 1 = sequential)'
     )
+    parser.add_argument(
+        '--pretrain',
+        action='store_true',
+        help='Pretrain mode: use all splits combined (for stable/predictable cell types)'
+    )
+    parser.add_argument(
+        '--finetune',
+        action='store_true',
+        help='Finetune mode: filter specific cell types based on ssl_mode'
+    )
 
     args = parser.parse_args()
 
@@ -851,6 +869,25 @@ def main():
     if args.data_dir is not None:
         config['dataset']['data_dir'] = args.data_dir
 
+    # Get pretrain/finetune settings from args or config
+    pretrain = args.pretrain or config.get('pretrain', False)
+    finetune = args.finetune or config.get('finetune', False)
+
+    # Validate pretrain/finetune combination
+    if pretrain and finetune:
+        raise ValueError("Cannot use both --pretrain and --finetune at the same time")
+
+    # Print training mode
+    if pretrain:
+        print("\n🎯 Training Mode: PRETRAIN")
+        print("   Using all splits combined with stable/predictable cell types")
+    elif finetune:
+        print("\n🎯 Training Mode: FINETUNE")
+        print("   Using filtered cell types based on ssl_mode")
+    else:
+        print("\n🎯 Training Mode: FROM SCRATCH")
+        print("   Using standard train/valid/test splits with all cell types")
+
     # Set device
     device = args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu'
     print(f"Using device: {device}")
@@ -864,9 +901,9 @@ def main():
     wandb_run = init_wandb(config)
 
     # Create datasets using Kirby
-    train_dataset = create_kirby_dataset(config, split='train')
-    valid_dataset = create_kirby_dataset(config, split='valid')
-    test_dataset = create_kirby_dataset(config, split='test')
+    train_dataset = create_kirby_dataset(config, split='train', pretrain=pretrain, finetune=finetune)
+    valid_dataset = create_kirby_dataset(config, split='valid', pretrain=pretrain, finetune=finetune)
+    test_dataset = create_kirby_dataset(config, split='test', pretrain=pretrain, finetune=finetune)
 
     # Stage 1: Train CEBRA per session
     print("\n" + "="*80)

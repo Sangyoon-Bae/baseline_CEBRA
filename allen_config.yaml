@@ -127,6 +127,10 @@ wandb:
 seed: 42
 deterministic: true
 
+# Training mode flags
+pretrain: false  # If true, combine all splits and use stable/predictable cell types
+finetune: false  # If true, filter specific cell types based on ssl_mode
+
 # Small model flag for testing
 small_model: false
 
