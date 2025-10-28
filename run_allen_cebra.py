@@ -303,6 +303,15 @@ def extract_neural_data(session_data):
     else:
         neural_data = neural_data_raw
 
+    # Safety check for data validity
+    if neural_data is None or len(neural_data) == 0:
+        raise ValueError("Neural data is empty or None")
+
+    # Check for NaN or Inf values
+    if np.any(np.isnan(neural_data)) or np.any(np.isinf(neural_data)):
+        print("Warning: NaN or Inf detected in neural data. Replacing with zeros.")
+        neural_data = np.nan_to_num(neural_data, nan=0.0, posinf=0.0, neginf=0.0)
+
     return neural_data
 
 
@@ -345,6 +354,18 @@ def extract_movie_frames(session_data, dataset):
 
             # Get actual movie frames from dataset
             if hasattr(dataset, 'movie_frames'):
+                # CRITICAL: Validate frame indices to prevent out of bounds access
+                max_frames = len(dataset.movie_frames)
+
+                # Clamp indices to valid range [0, max_frames-1]
+                frame_indices = np.clip(frame_indices, 0, max_frames - 1)
+
+                # Additional safety check
+                if np.any(frame_indices < 0) or np.any(frame_indices >= max_frames):
+                    print(f"Warning: Frame indices out of bounds detected. Max frames: {max_frames}")
+                    print(f"  Min index: {frame_indices.min()}, Max index: {frame_indices.max()}")
+                    frame_indices = np.clip(frame_indices, 0, max_frames - 1)
+
                 movie_frames = dataset.movie_frames[frame_indices, :, :]
                 return torch.from_numpy(movie_frames).float()
             else:
@@ -463,6 +484,13 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
                 neural_data = extract_neural_data(session_data)
                 movie_frames = extract_movie_frames(session_data, train_dataset)  # Shape: (T, H, W)
 
+                # Validate data shapes
+                if len(neural_data) != len(movie_frames):
+                    print(f"Warning: Length mismatch for session {session_id}. Neural: {len(neural_data)}, Frames: {len(movie_frames)}. Taking minimum.")
+                    min_len = min(len(neural_data), len(movie_frames))
+                    neural_data = neural_data[:min_len]
+                    movie_frames = movie_frames[:min_len]
+
                 # Get pre-trained CEBRA model for this session
                 cebra_model = train_cebra_models[session_id]
 
@@ -470,46 +498,118 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
                 with torch.no_grad():
                     embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
 
-                # Prepare movie frames
+                # Prepare movie frames with normalization
                 targets = movie_frames.unsqueeze(1).float().to(device)  # Add channel dim
+
+                # Normalize to [0, 1] range if needed
+                if targets.max() > 1.0:
+                    targets = targets / 255.0
+
+                # Clip to valid range
+                targets = torch.clamp(targets, 0.0, 1.0)
 
                 # Mini-batch training
                 num_samples = len(embeddings)
-                indices = torch.randperm(num_samples)
+
+                # Safety check: ensure we have valid samples
+                if num_samples == 0:
+                    print(f"Warning: No samples for session {session_id}. Skipping.")
+                    continue
+
+                # Ensure embeddings and targets have matching sizes
+                if len(embeddings) != len(targets):
+                    print(f"Warning: Size mismatch for session {session_id}. Embeddings: {len(embeddings)}, Targets: {len(targets)}. Skipping.")
+                    continue
+
+                indices = torch.randperm(num_samples, device=embeddings.device)
 
                 for i in range(0, num_samples, batch_size):
-                    batch_indices = indices[i:i+batch_size]
-                    batch_embeddings = embeddings[batch_indices]
-                    batch_targets = targets[batch_indices]
+                    try:
+                        # Ensure batch_indices doesn't exceed bounds
+                        end_idx = min(i + batch_size, num_samples)
+                        batch_indices = indices[i:end_idx]
 
-                    # Forward pass
-                    predictions = decoder(batch_embeddings)
+                        # Skip if batch is too small (optional, but helps with stability)
+                        if len(batch_indices) == 0:
+                            continue
 
-                    # Ensure predictions have channel dimension
-                    if predictions.dim() == 3:
-                        predictions = predictions.unsqueeze(1)
+                        # Verify indices are within bounds
+                        if torch.max(batch_indices) >= num_samples or torch.min(batch_indices) < 0:
+                            print(f"Warning: Invalid batch indices detected in session {session_id}, batch {i}. Max: {torch.max(batch_indices)}, Min: {torch.min(batch_indices)}, Num samples: {num_samples}")
+                            continue
 
-                    # Compute all 6 losses
-                    loss_l1_val = l1_loss(predictions, batch_targets)
-                    loss_ssim_val = ssim_loss(predictions, batch_targets)
-                    loss_perceptual_val = perceptual_loss(predictions, batch_targets)
-                    loss_gradient_val = gradient_loss(predictions, batch_targets)
-                    loss_focal_val = focal_loss(predictions, batch_targets)
-                    loss_fft_val = fft_loss(predictions, batch_targets)
+                        # Safe indexing with bounds check
+                        batch_embeddings = embeddings[batch_indices]
+                        batch_targets = targets[batch_indices]
 
-                    # Weighted combination of losses
-                    total_loss = (
-                        loss_weights['l1'] * loss_l1_val +
-                        loss_weights['ssim'] * loss_ssim_val +
-                        loss_weights['perceptual'] * loss_perceptual_val +
-                        loss_weights['gradient'] * loss_gradient_val +
-                        loss_weights['focal'] * loss_focal_val +
-                        loss_weights['fft'] * loss_fft_val
-                    )
+                        # Forward pass
+                        predictions = decoder(batch_embeddings)
+
+                        # Ensure predictions have channel dimension
+                        if predictions.dim() == 3:
+                            predictions = predictions.unsqueeze(1)
+
+                        # Clamp predictions to valid range
+                        predictions = torch.clamp(predictions, 0.0, 1.0)
+
+                    except (IndexError, RuntimeError) as e:
+                        print(f"Warning: Indexing/forward error in session {session_id}, batch {i}: {e}")
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        continue
+
+                    # Compute all 6 losses with error handling
+                    try:
+                        loss_l1_val = l1_loss(predictions, batch_targets)
+                        loss_ssim_val = ssim_loss(predictions, batch_targets)
+                        loss_perceptual_val = perceptual_loss(predictions, batch_targets)
+                        loss_gradient_val = gradient_loss(predictions, batch_targets)
+                        loss_focal_val = focal_loss(predictions, batch_targets)
+                        loss_fft_val = fft_loss(predictions, batch_targets)
+
+                        # Check each loss for NaN/Inf
+                        losses_dict = {
+                            'l1': loss_l1_val, 'ssim': loss_ssim_val,
+                            'perceptual': loss_perceptual_val, 'gradient': loss_gradient_val,
+                            'focal': loss_focal_val, 'fft': loss_fft_val
+                        }
+
+                        has_invalid = False
+                        for loss_name, loss_val in losses_dict.items():
+                            if torch.isnan(loss_val) or torch.isinf(loss_val):
+                                print(f"Warning: NaN/Inf detected in {loss_name} loss for session {session_id}, batch {i}")
+                                has_invalid = True
+
+                        if has_invalid:
+                            print(f"Skipping batch due to invalid loss values")
+                            continue
+
+                        # Weighted combination of losses
+                        total_loss = (
+                            loss_weights['l1'] * loss_l1_val +
+                            loss_weights['ssim'] * loss_ssim_val +
+                            loss_weights['perceptual'] * loss_perceptual_val +
+                            loss_weights['gradient'] * loss_gradient_val +
+                            loss_weights['focal'] * loss_focal_val +
+                            loss_weights['fft'] * loss_fft_val
+                        )
+
+                        # Final check for NaN/Inf in total loss
+                        if torch.isnan(total_loss) or torch.isinf(total_loss):
+                            print(f"Warning: NaN/Inf detected in total loss for session {session_id}, batch {i}. Skipping batch.")
+                            continue
+
+                    except Exception as e:
+                        print(f"Warning: Error computing loss for session {session_id}, batch {i}: {e}")
+                        continue
 
                     # Backward pass
                     optimizer.zero_grad()
                     total_loss.backward()
+
+                    # Gradient clipping to prevent explosion
+                    torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
+
                     optimizer.step()
 
                     # Track losses
@@ -521,6 +621,13 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
                     train_loss_details['focal'].append(loss_focal_val.item())
                     train_loss_details['fft'].append(loss_fft_val.item())
 
+            except RuntimeError as e:
+                if 'CUDA' in str(e) or 'out of bounds' in str(e):
+                    print(f"⚠️  CUDA error in session {session_id}: {e}")
+                    print(f"   Synchronizing CUDA and continuing...")
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                continue
             except Exception as e:
                 print(f"Warning: Error processing session {session_id}: {e}")
                 continue
@@ -551,19 +658,46 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
                     neural_data = extract_neural_data(session_data)
                     movie_frames = extract_movie_frames(session_data, valid_dataset)
 
+                    # Validate data shapes
+                    if len(neural_data) != len(movie_frames):
+                        print(f"Warning: Length mismatch in validation for session {session_id}. Neural: {len(neural_data)}, Frames: {len(movie_frames)}. Taking minimum.")
+                        min_len = min(len(neural_data), len(movie_frames))
+                        neural_data = neural_data[:min_len]
+                        movie_frames = movie_frames[:min_len]
+
                     # Get pre-trained CEBRA model for this session
                     cebra_model = valid_cebra_models[session_id]
 
                     # Generate embeddings
                     embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
 
+                    # Prepare targets with normalization
                     targets = movie_frames.unsqueeze(1).float().to(device)
+
+                    # Normalize to [0, 1] range if needed
+                    if targets.max() > 1.0:
+                        targets = targets / 255.0
+
+                    # Clip to valid range
+                    targets = torch.clamp(targets, 0.0, 1.0)
+
+                    # Safety check: ensure embeddings and targets match
+                    if len(embeddings) != len(targets):
+                        print(f"Warning: Size mismatch in validation for session {session_id}. Embeddings: {len(embeddings)}, Targets: {len(targets)}. Skipping.")
+                        continue
+
+                    if len(embeddings) == 0:
+                        print(f"Warning: No samples in validation for session {session_id}. Skipping.")
+                        continue
 
                     predictions = decoder(embeddings)
 
                     # Ensure predictions have channel dimension
                     if predictions.dim() == 3:
                         predictions = predictions.unsqueeze(1)
+
+                    # Clamp predictions to valid range
+                    predictions = torch.clamp(predictions, 0.0, 1.0)
 
                     # Compute all 6 losses
                     loss_l1_val = l1_loss(predictions, targets)
@@ -597,6 +731,13 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
                         first_predictions = predictions[:8].detach().cpu()  # Save up to 8 samples
                         first_targets = targets[:8].detach().cpu()
 
+                except RuntimeError as e:
+                    if 'CUDA' in str(e) or 'out of bounds' in str(e):
+                        print(f"⚠️  CUDA error in validation session {session_id}: {e}")
+                        print(f"   Synchronizing CUDA and continuing...")
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                    continue
                 except Exception as e:
                     continue
 
@@ -711,13 +852,31 @@ def visualize_results(decoder, test_cebra_models, test_dataset, output_dir, devi
         # Generate embeddings and predictions
         cebra_model = test_cebra_models[session_id]
         embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
+
+        # Safety check
+        if len(embeddings) == 0:
+            print("⚠️  No embeddings available for visualization")
+            return None
+
         predictions = decoder(embeddings).cpu()
 
-        # Select random samples
-        indices = np.random.choice(len(predictions), size=min(num_samples, len(predictions)), replace=False)
+        # Safety check for predictions
+        if len(predictions) == 0:
+            print("⚠️  No predictions available for visualization")
+            return None
+
+        # Select random samples (with bounds checking)
+        num_available = len(predictions)
+        num_to_sample = min(num_samples, num_available)
+
+        if num_to_sample == 0:
+            print("⚠️  No samples available for visualization")
+            return None
+
+        indices = np.random.choice(num_available, size=num_to_sample, replace=False)
 
         # Create visualization
-        fig, axes = plt.subplots(num_samples, 2, figsize=(10, num_samples * 3))
+        fig, axes = plt.subplots(num_to_sample, 2, figsize=(10, num_to_sample * 3))
 
         for i, idx in enumerate(indices):
             # Original frame

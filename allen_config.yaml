@@ -88,18 +88,19 @@ training:
 decoder:
   # Note: latent_dim is now automatically set to match CEBRA output_dimension
   # No need to specify latent_dim separately in two-stage training
-  learning_rate: 0.001
+  learning_rate: 0.0001  # Reduced from 0.001 to prevent gradient explosion
   num_epochs: 25
   batch_size: 32
 
   # Loss weights (6 losses for comprehensive image reconstruction)
+  # Reduced weights to prevent infinity loss
   loss_weights:
-    l1: 1.0          # L1 Loss - robust pixel-level reconstruction
-    ssim: 0.5        # SSIM Loss - structural similarity
-    perceptual: 0.3  # Perceptual Loss (AlexNet) - high-level semantic features
-    gradient: 0.2    # Gradient Difference Loss - edge preservation
-    focal: 0.1       # Focal Loss - focus on hard examples
-    fft: 0.2         # FFT Loss - frequency domain matching
+    l1: 1.0           # L1 Loss - robust pixel-level reconstruction
+    ssim: 0.3         # SSIM Loss - structural similarity (reduced from 0.5)
+    perceptual: 0.00003  # Perceptual Loss (AlexNet) - high-level semantic features (200000 * 0.00003 = 6)
+    gradient: 0.05    # Gradient Difference Loss - edge preservation (120 * 0.05 = 6)
+    focal: 0.05       # Focal Loss - focus on hard examples (reduced from 0.1)
+    fft: 0.1          # FFT Loss - frequency domain matching (reduced from 0.2)
 
 # Output Configuration
 output:

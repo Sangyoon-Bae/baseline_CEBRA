@@ -45,21 +45,32 @@ class FFTLoss(nn.Module):
         # --- Defensive checks ---
         if pred.shape != true.shape:
             raise ValueError(f"Input shapes must be the same. Got {pred.shape} and {true.shape}")
-        
+
+        # Clamp inputs to valid range
+        pred = torch.clamp(pred, -10.0, 10.0)
+        true = torch.clamp(true, -10.0, 10.0)
+
         # --- Compute FFT ---
         # Apply N-dimensional FFT. Using `fftn` is general for 2D/3D.
         # The result is a complex tensor.
         pred_fft = torch.fft.fftn(pred, dim=(-2, -1))
         true_fft = torch.fft.fftn(true, dim=(-2, -1))
-        
+
         # --- Compute loss on the magnitude of the spectrum ---
         # The phase information is usually discarded. We compute loss on the absolute values (magnitudes).
         pred_fft_mag = torch.abs(pred_fft)
         true_fft_mag = torch.abs(true_fft)
 
+        # Clamp FFT magnitudes to prevent extreme values
+        pred_fft_mag = torch.clamp(pred_fft_mag, 0.0, 1e4)
+        true_fft_mag = torch.clamp(true_fft_mag, 0.0, 1e4)
+
         # Calculate the loss between the frequency spectrums
         loss = self.loss_fn(pred_fft_mag, true_fft_mag, reduction=self.reduction)
-        
+
+        # Clamp final loss
+        loss = torch.clamp(loss, 0.0, 1e3)
+
         return loss
 
 class GradientDifferenceLoss(nn.Module):
@@ -134,20 +145,27 @@ class GradientDifferenceLoss(nn.Module):
         self.conv_x.to(pred.device)
         self.conv_y.to(pred.device)
 
+        # Clamp inputs to valid range
+        pred = torch.clamp(pred, -10.0, 10.0)
+        true = torch.clamp(true, -10.0, 10.0)
+
         # Calculate gradients in x and y directions for both images
         pred_grad_x = self.conv_x(pred)
         true_grad_x = self.conv_x(true)
-        
+
         pred_grad_y = self.conv_y(pred)
         true_grad_y = self.conv_y(true)
 
         # Compute the loss for each direction
         loss_x = self.loss_fn(pred_grad_x, true_grad_x)
         loss_y = self.loss_fn(pred_grad_y, true_grad_y)
-        
+
         # Total loss is the sum of the losses in both directions
         total_loss = loss_x + loss_y
-        
+
+        # Clamp to prevent extreme values
+        total_loss = torch.clamp(total_loss, 0.0, 1e3)
+
         return total_loss
 
 class LaplacianLoss(nn.Module):
@@ -295,7 +313,7 @@ class AlexNetPerceptualLoss(nn.Module):
         super().__init__()
         alexnet = models.alexnet(weights='IMAGENET1K_V1').features.eval()
         self.features = nn.Sequential(*list(alexnet.children())[:layer+1])
-        
+
         for param in self.features.parameters():
             param.requires_grad = False
 
@@ -305,11 +323,30 @@ class AlexNetPerceptualLoss(nn.Module):
 
     def forward(self, pred, target):
         device = next(self.features.parameters()).device
+
+        # Convert grayscale to RGB if needed (repeat channel 3 times)
+        if pred.size(1) == 1:
+            pred = pred.repeat(1, 3, 1, 1)
+        if target.size(1) == 1:
+            target = target.repeat(1, 3, 1, 1)
+
         pred = pred.to(device)
-        target = target.to(device) 
+        target = target.to(device)
+
+        # Normalize
         pred = (pred - self.mean) / self.std
         target = (target - self.mean) / self.std
-        return F.mse_loss(self.features(pred), self.features(target))
+
+        # Extract features and compute loss
+        pred_features = self.features(pred)
+        target_features = self.features(target)
+
+        loss = F.mse_loss(pred_features, target_features)
+
+        # Clamp loss to prevent infinity
+        loss = torch.clamp(loss, max=1e6)
+
+        return loss
 
 
 class TVLoss(nn.Module):
@@ -380,12 +417,27 @@ class ContrastiveLoss(torch.nn.Module):
 class SSIMLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        self.ssim = StructuralSimilarityIndexMeasure()
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
 
     def forward(self, output, target):
-        device = output.get_device()
+        device = output.get_device() if output.get_device() >= 0 else torch.device('cpu')
         self.ssim = self.ssim.to(device)
-        return 1-self.ssim(output, target)
+
+        # Clamp values to valid range [0, 1]
+        output = torch.clamp(output, 0.0, 1.0)
+        target = torch.clamp(target, 0.0, 1.0)
+
+        ssim_value = self.ssim(output, target)
+
+        # Clamp SSIM result to prevent NaN
+        ssim_value = torch.clamp(ssim_value, -1.0, 1.0)
+
+        loss = 1 - ssim_value
+
+        # Ensure loss is non-negative and bounded
+        loss = torch.clamp(loss, 0.0, 2.0)
+
+        return loss
 
 
 class FocalLoss(nn.Module):
@@ -394,25 +446,36 @@ class FocalLoss(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
         self.loss_type = loss_type
-    
+
     def forward(self, pred, target):
         pred = pred.float()
         target = target.float()
 
         if self.loss_type == 'l1':
             base_loss = F.l1_loss(pred, target, reduction='none')
-        
+
         # Calculate confidence (1 - normalized error)
         error = torch.abs(pred - target)
         max_error = error.max()
-        confidence = 1 - (error / (max_error + 1e-8))
-        
+
+        # Add larger epsilon for numerical stability
+        max_error = torch.clamp(max_error, min=1e-6)
+
+        confidence = 1 - (error / (max_error + 1e-6))
+        confidence = torch.clamp(confidence, 0.0, 1.0)
+
         # Focal weight: (1-confidence)^gamma
         focal_weight = (1 - confidence) ** self.gamma
-        
+
+        # Clamp focal weight to prevent extreme values
+        focal_weight = torch.clamp(focal_weight, 0.0, 10.0)
+
         # Apply focal loss
         focal_loss = self.alpha * focal_weight * base_loss
-        
+
+        # Clamp final loss
+        focal_loss = torch.clamp(focal_loss, 0.0, 1e3)
+
         return focal_loss.mean()
 
 class MultiScaleLoss(nn.Module):
