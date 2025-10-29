@@ -144,6 +144,55 @@ def create_kirby_dataset(config, split='train', pretrain=False, finetune=False):
     print(f"✅ Dataset created with {len(dataset)} sessions")
     return dataset
 
+def load_pretrained_cebra_models(pretrained_dir, split='train'):
+    """
+    Load pretrained CEBRA models from directory
+
+    Args:
+        pretrained_dir: Directory containing pretrained CEBRA models
+        split: Which split to load ('train', 'valid', or 'test')
+
+    Returns:
+        Dictionary mapping session_id to loaded CEBRA model
+    """
+    if not CEBRA_AVAILABLE:
+        raise ImportError("CEBRA is not available. Please install it.")
+
+    pretrained_dir = Path(pretrained_dir)
+    split_dir = pretrained_dir / split
+
+    if not split_dir.exists():
+        raise FileNotFoundError(f"Pretrained split directory not found: {split_dir}")
+
+    print(f"\n{'='*80}")
+    print(f"Loading Pretrained CEBRA Models ({split} split)")
+    print(f"{'='*80}")
+    print(f"Loading from: {split_dir}")
+
+    cebra_models = {}
+    model_files = list(split_dir.glob("cebra_*.pt"))
+
+    if len(model_files) == 0:
+        raise FileNotFoundError(f"No CEBRA model files found in {split_dir}")
+
+    print(f"Found {len(model_files)} pretrained CEBRA models")
+
+    for model_path in tqdm(model_files, desc=f"Loading CEBRA models ({split})"):
+        # Extract session_id from filename (e.g., cebra_session123.pt -> session123)
+        session_id = model_path.stem.replace("cebra_", "")
+
+        try:
+            # Load CEBRA model
+            cebra_model = cebra.CEBRA.load(str(model_path))
+            cebra_models[session_id] = cebra_model
+        except Exception as e:
+            print(f"  ⚠️  Error loading CEBRA model for session {session_id}: {e}")
+            continue
+
+    print(f"✅ Loaded {len(cebra_models)} pretrained CEBRA models")
+    return cebra_models
+
+
 def train_single_cebra(session_id, dataset, config, device_id):
     """
     Train CEBRA for a single session on a specific GPU
@@ -184,7 +233,7 @@ def train_single_cebra(session_id, dataset, config, device_id):
         return (session_id, None)
 
 
-def train_cebra_per_session(config, dataset, split='train', device='cuda', num_gpus=None):
+def train_cebra_per_session(config, dataset, split='train', device='cuda', num_gpus=None, pretrained_models=None):
     """
     Train CEBRA model separately for each session (to handle different neuron counts)
     Supports multi-GPU parallel training
@@ -195,6 +244,7 @@ def train_cebra_per_session(config, dataset, split='train', device='cuda', num_g
         split: 'train', 'valid', or 'test'
         device: Device to use ('cuda' or 'cpu')
         num_gpus: Number of GPUs to use (None = use all available, 1 = sequential)
+        pretrained_models: Dictionary of pretrained CEBRA models (optional)
 
     Returns:
         Dictionary mapping session_id to trained CEBRA model
@@ -205,6 +255,11 @@ def train_cebra_per_session(config, dataset, split='train', device='cuda', num_g
     print(f"\n{'='*80}")
     print(f"Training CEBRA Models Per Session ({split} split)")
     print(f"{'='*80}")
+
+    # Check if pretrained models are provided
+    if pretrained_models is not None:
+        print(f"Using {len(pretrained_models)} pretrained CEBRA models")
+        print("Will only train models for sessions without pretrained weights")
 
     # Determine number of GPUs to use
     if device == 'cpu':
@@ -224,15 +279,36 @@ def train_cebra_per_session(config, dataset, split='train', device='cuda', num_g
     session_cebra_models = {}
     session_ids = dataset.session_ids
 
+    # Separate sessions into pretrained and need-training
+    sessions_to_train = []
+    if pretrained_models is not None:
+        for session_id in session_ids:
+            if session_id in pretrained_models:
+                # Use pretrained model
+                session_cebra_models[session_id] = pretrained_models[session_id]
+            else:
+                # Need to train this session
+                sessions_to_train.append(session_id)
+        print(f"Using {len(session_cebra_models)} pretrained models")
+        print(f"Will train {len(sessions_to_train)} new models")
+    else:
+        sessions_to_train = session_ids
+        print(f"Training {len(sessions_to_train)} models from scratch")
+
+    # Skip training if no sessions need training
+    if len(sessions_to_train) == 0:
+        print(f"✅ All sessions use pretrained models, no training needed")
+        return session_cebra_models
+
     # Multi-GPU parallel training
     if num_gpus > 1:
         # Distribute sessions across GPUs
-        session_gpu_map = [(sid, i % num_gpus) for i, sid in enumerate(session_ids)]
+        session_gpu_map = [(sid, i % num_gpus) for i, sid in enumerate(sessions_to_train)]
 
-        print(f"Distributing {len(session_ids)} sessions across {num_gpus} GPUs...")
+        print(f"Distributing {len(sessions_to_train)} sessions across {num_gpus} GPUs...")
 
         # Process sessions in parallel
-        with tqdm(total=len(session_ids), desc=f"Training CEBRA ({split})") as pbar:
+        with tqdm(total=len(sessions_to_train), desc=f"Training CEBRA ({split})") as pbar:
             # Use threading for I/O bound tasks (each GPU handles its own sessions)
             from concurrent.futures import ThreadPoolExecutor
 
@@ -255,7 +331,7 @@ def train_cebra_per_session(config, dataset, split='train', device='cuda', num_g
     # Single GPU or CPU (sequential)
     else:
         device_id = 0 if num_gpus == 1 else 'cpu'
-        for session_id in tqdm(session_ids, desc=f"Training CEBRA ({split})"):
+        for session_id in tqdm(sessions_to_train, desc=f"Training CEBRA ({split})"):
             session_id_result, cebra_model = train_single_cebra(
                 session_id, dataset, config, device_id
             )
@@ -375,7 +451,7 @@ def extract_movie_frames(session_data, dataset):
 
     raise AttributeError(f"Cannot extract movie frames. Available attributes: {session_data.keys}")
 
-def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dataset, valid_dataset, device='cuda', wandb_run=None):
+def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dataset, valid_dataset, device='cuda', wandb_run=None, start_epoch=0, checkpoint_path=None):
     """
     Train HalfUNet decoder using pre-trained CEBRA embeddings
 
@@ -391,6 +467,8 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
         valid_dataset: Validation dataset
         device: Device to use for training
         wandb_run: Weights & Biases run object for logging
+        start_epoch: Starting epoch (for resume training)
+        checkpoint_path: Path to checkpoint directory for saving models
 
     Returns:
         Trained HalfUNet decoder
@@ -460,10 +538,47 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
     print(f"  Batch size: {batch_size}")
     print(f"  Learning rate: {optimizer.param_groups[0]['lr']}")
 
-    # Training loop
-    best_valid_loss = float('inf')
+    # Setup checkpoint directory
+    if checkpoint_path is None:
+        checkpoint_path = Path(config['output']['save_dir']) / 'checkpoints'
+    else:
+        checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+    print(f"Checkpoint directory: {checkpoint_path}")
 
-    for epoch in range(num_epochs):
+    # Load checkpoint if resuming training
+    best_valid_loss = float('inf')
+    best_valid_ssim = 0.0
+    if start_epoch > 0:
+        last_checkpoint = checkpoint_path / 'last_model.pt'
+        if last_checkpoint.exists():
+            print(f"\n🔄 Loading checkpoint from epoch {start_epoch}")
+            checkpoint = torch.load(last_checkpoint)
+
+            # Load model state
+            if isinstance(decoder, nn.DataParallel):
+                decoder.module.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                decoder.load_state_dict(checkpoint['model_state_dict'])
+
+            # Load optimizer state
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+            # Load best metrics
+            best_valid_loss = checkpoint.get('best_valid_loss', float('inf'))
+            best_valid_ssim = checkpoint.get('best_valid_ssim', 0.0)
+
+            print(f"  ✅ Resumed from epoch {start_epoch}")
+            print(f"  Best validation loss: {best_valid_loss:.4f}")
+            print(f"  Best validation SSIM: {best_valid_ssim:.4f}")
+        else:
+            print(f"\n⚠️  Warning: No checkpoint found at {last_checkpoint}")
+            print("  Starting training from scratch")
+            start_epoch = 0
+
+    # Training loop
+
+    for epoch in range(start_epoch, num_epochs):
         decoder.train()
         train_losses = []
         train_loss_details = {
@@ -641,6 +756,7 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
             'l1': [], 'ssim': [], 'perceptual': [],
             'gradient': [], 'focal': [], 'fft': []
         }
+        valid_ssim_scores = []  # For tracking SSIM metric (not loss)
 
         # For wandb image logging (save first batch of predictions)
         first_predictions = None
@@ -707,6 +823,12 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
                     loss_focal_val = focal_loss(predictions, targets)
                     loss_fft_val = fft_loss(predictions, targets)
 
+                    # Calculate SSIM score (metric, not loss)
+                    # SSIM score ranges from -1 to 1, where 1 means perfect similarity
+                    # SSIMLoss typically returns (1 - SSIM), so we convert it back
+                    ssim_score = 1.0 - loss_ssim_val.item()
+                    valid_ssim_scores.append(ssim_score)
+
                     # Weighted combination of losses
                     total_loss = (
                         loss_weights['l1'] * loss_l1_val +
@@ -742,6 +864,7 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
                     continue
 
         avg_valid_loss = np.mean(valid_losses) if valid_losses else float('inf')
+        avg_valid_ssim = np.mean(valid_ssim_scores) if valid_ssim_scores else 0.0
 
         # Calculate average for each loss component
         avg_train_loss_details = {k: np.mean(v) if v else 0.0 for k, v in train_loss_details.items()}
@@ -750,6 +873,7 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
         # Print summary
         print(f"\nEpoch {epoch+1}/{num_epochs}")
         print(f"  Train Loss: {avg_train_loss:.4f} | Valid Loss: {avg_valid_loss:.4f}")
+        print(f"  Validation SSIM Score: {avg_valid_ssim:.4f}")
         print(f"  Loss breakdown (train/valid):")
         print(f"    L1:         {avg_train_loss_details['l1']:.4f} / {avg_valid_loss_details['l1']:.4f}")
         print(f"    SSIM:       {avg_train_loss_details['ssim']:.4f} / {avg_valid_loss_details['ssim']:.4f}")
@@ -764,6 +888,7 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
                 'epoch': epoch + 1,
                 'train/total_loss': avg_train_loss,
                 'valid/total_loss': avg_valid_loss,
+                'average_val_metric': avg_valid_ssim,  # SSIM score for validation
 
                 # Train loss components
                 'train/l1_loss': avg_train_loss_details['l1'],
@@ -803,10 +928,30 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
 
             wandb_run.log(log_dict)
 
-        # Save best model
-        if avg_valid_loss < best_valid_loss:
+        # Prepare checkpoint dictionary
+        model_state = decoder.module.state_dict() if isinstance(decoder, nn.DataParallel) else decoder.state_dict()
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model_state,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'valid_loss': avg_valid_loss,
+            'valid_ssim': avg_valid_ssim,
+            'best_valid_loss': best_valid_loss,
+            'best_valid_ssim': best_valid_ssim,
+            'config': config
+        }
+
+        # Save last model (every epoch)
+        last_checkpoint_path = checkpoint_path / 'last_model.pt'
+        torch.save(checkpoint, last_checkpoint_path)
+
+        # Save best model (based on SSIM score)
+        if avg_valid_ssim > best_valid_ssim:
+            best_valid_ssim = avg_valid_ssim
             best_valid_loss = avg_valid_loss
-            print(f"  ✅ New best model saved!")
+            best_checkpoint_path = checkpoint_path / 'best_model.pt'
+            torch.save(checkpoint, best_checkpoint_path)
+            print(f"  ✅ New best model saved! (SSIM: {best_valid_ssim:.4f})")
 
     print("✅ Decoder training complete!")
     print("HalfUNet decoder has been trained on frozen CEBRA embeddings")
@@ -901,6 +1046,124 @@ def visualize_results(decoder, test_cebra_models, test_dataset, output_dir, devi
         print(f"✅ Visualization saved to {save_path}")
 
     return save_path
+
+def save_test_results(decoder, test_cebra_models, test_dataset, output_dir, device='cuda'):
+    """
+    Save test ground truth and predictions to true.pt and pred.pt
+
+    Args:
+        decoder: Trained HalfUNet decoder
+        test_cebra_models: Dictionary of session_id -> trained CEBRA model (test)
+        test_dataset: Test dataset
+        output_dir: Output directory for saving results
+        device: Device to use
+    """
+    print(f"\n{'='*80}")
+    print("Saving Test Results (Ground Truth and Predictions)")
+    print(f"{'='*80}")
+
+    decoder.eval()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    all_predictions = []
+    all_ground_truths = []
+
+    with torch.no_grad():
+        for session_id in tqdm(test_dataset.session_ids, desc="Generating test predictions"):
+            try:
+                # Skip if no CEBRA model for this session
+                if session_id not in test_cebra_models:
+                    print(f"  ⚠️  No CEBRA model for session {session_id}, skipping")
+                    continue
+
+                session_data = test_dataset.get_session_data(session_id)
+
+                # Get neural data and movie frames
+                neural_data = extract_neural_data(session_data)
+                movie_frames = extract_movie_frames(session_data, test_dataset)
+
+                # Validate data shapes
+                if len(neural_data) != len(movie_frames):
+                    print(f"  ⚠️  Length mismatch for session {session_id}. Neural: {len(neural_data)}, Frames: {len(movie_frames)}. Taking minimum.")
+                    min_len = min(len(neural_data), len(movie_frames))
+                    neural_data = neural_data[:min_len]
+                    movie_frames = movie_frames[:min_len]
+
+                if len(neural_data) == 0:
+                    print(f"  ⚠️  No samples for session {session_id}, skipping")
+                    continue
+
+                # Get CEBRA model for this session
+                cebra_model = test_cebra_models[session_id]
+
+                # Generate embeddings
+                embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
+
+                # Generate predictions
+                predictions = decoder(embeddings)
+
+                # Ensure predictions have channel dimension
+                if predictions.dim() == 3:
+                    predictions = predictions.unsqueeze(1)
+
+                # Clamp predictions to valid range
+                predictions = torch.clamp(predictions, 0.0, 1.0)
+
+                # Prepare ground truth with same preprocessing as training
+                ground_truth = movie_frames.unsqueeze(1).float()  # Add channel dim
+
+                # Normalize to [0, 1] range if needed
+                if ground_truth.max() > 1.0:
+                    ground_truth = ground_truth / 255.0
+
+                # Clip to valid range
+                ground_truth = torch.clamp(ground_truth, 0.0, 1.0)
+
+                # Move to CPU and collect
+                all_predictions.append(predictions.cpu())
+                all_ground_truths.append(ground_truth.cpu())
+
+            except Exception as e:
+                print(f"  ⚠️  Error processing session {session_id}: {e}")
+                continue
+
+    # Concatenate all results
+    if len(all_predictions) == 0 or len(all_ground_truths) == 0:
+        print("⚠️  No test results to save")
+        return None, None
+
+    all_predictions = torch.cat(all_predictions, dim=0)
+    all_ground_truths = torch.cat(all_ground_truths, dim=0)
+
+    # Verify shapes match
+    print(f"\n📊 Test Results Shape:")
+    print(f"  Ground Truth: {all_ground_truths.shape}")
+    print(f"  Predictions:  {all_predictions.shape}")
+
+    if all_ground_truths.shape != all_predictions.shape:
+        print(f"⚠️  Warning: Shape mismatch detected!")
+        print(f"  Ground Truth: {all_ground_truths.shape}")
+        print(f"  Predictions:  {all_predictions.shape}")
+        # Try to fix by matching the minimum size
+        min_size = min(len(all_ground_truths), len(all_predictions))
+        all_ground_truths = all_ground_truths[:min_size]
+        all_predictions = all_predictions[:min_size]
+        print(f"  Adjusted to: {all_ground_truths.shape}")
+
+    # Save to files
+    true_path = output_dir / 'true.pt'
+    pred_path = output_dir / 'pred.pt'
+
+    torch.save(all_ground_truths, true_path)
+    torch.save(all_predictions, pred_path)
+
+    print(f"\n✅ Test results saved:")
+    print(f"  Ground Truth: {true_path} (shape: {all_ground_truths.shape})")
+    print(f"  Predictions:  {pred_path} (shape: {all_predictions.shape})")
+    print(f"  Total samples: {len(all_ground_truths)}")
+
+    return true_path, pred_path
 
 def save_results(train_cebra_models, valid_cebra_models, test_cebra_models, decoder, config):
     """
@@ -1013,6 +1276,28 @@ def main():
         action='store_true',
         help='Finetune mode: filter specific cell types based on ssl_mode'
     )
+    parser.add_argument(
+        '--pretrained_cebra_dir',
+        type=str,
+        default=None,
+        help='Directory containing pretrained CEBRA models (e.g., results/cebra_models_20231201_120000)'
+    )
+    parser.add_argument(
+        '--freeze_cebra',
+        action='store_true',
+        help='Freeze CEBRA models during finetune (only train decoder)'
+    )
+    parser.add_argument(
+        '--continue_learning',
+        action='store_true',
+        help='Continue training from last checkpoint'
+    )
+    parser.add_argument(
+        '--checkpoint_dir',
+        type=str,
+        default=None,
+        help='Directory containing checkpoints (default: output_dir/checkpoints)'
+    )
 
     args = parser.parse_args()
 
@@ -1064,25 +1349,61 @@ def main():
     valid_dataset = create_kirby_dataset(config, split='valid', pretrain=pretrain, finetune=finetune)
     test_dataset = create_kirby_dataset(config, split='test', pretrain=pretrain, finetune=finetune)
 
-    # Stage 1: Train CEBRA per session
+    # Stage 1: Train or Load CEBRA per session
     print("\n" + "="*80)
-    print("Stage 1: Training CEBRA Models Per Session")
+    print("Stage 1: Training/Loading CEBRA Models Per Session")
     print("="*80)
     print("Each session has different neuron counts - training separate CEBRA models")
 
-    if args.skip_cebra and args.cebra_model_path:
-        print(f"\n⚠️  --skip_cebra not supported in two-stage training")
-        print("   Training CEBRA from scratch for each session...")
+    # Load pretrained CEBRA models if provided
+    pretrained_train_models = None
+    pretrained_valid_models = None
+    pretrained_test_models = None
 
-    train_cebra_models = train_cebra_per_session(config, train_dataset, split='train', device=device, num_gpus=args.num_gpus)
-    valid_cebra_models = train_cebra_per_session(config, valid_dataset, split='valid', device=device, num_gpus=args.num_gpus)
-    test_cebra_models = train_cebra_per_session(config, test_dataset, split='test', device=device, num_gpus=args.num_gpus)
+    if args.pretrained_cebra_dir is not None:
+        print(f"\n🔄 Loading pretrained CEBRA models from: {args.pretrained_cebra_dir}")
+        try:
+            pretrained_train_models = load_pretrained_cebra_models(args.pretrained_cebra_dir, split='train')
+            pretrained_valid_models = load_pretrained_cebra_models(args.pretrained_cebra_dir, split='valid')
+            pretrained_test_models = load_pretrained_cebra_models(args.pretrained_cebra_dir, split='test')
+
+            if args.freeze_cebra:
+                print("\n❄️  CEBRA models will be FROZEN (only decoder will be trained)")
+            else:
+                print("\n🔥 CEBRA models will continue training (fine-tuning)")
+        except Exception as e:
+            print(f"\n⚠️  Error loading pretrained models: {e}")
+            print("   Will train from scratch instead")
+            pretrained_train_models = None
+            pretrained_valid_models = None
+            pretrained_test_models = None
+
+    train_cebra_models = train_cebra_per_session(config, train_dataset, split='train', device=device, num_gpus=args.num_gpus, pretrained_models=pretrained_train_models)
+    valid_cebra_models = train_cebra_per_session(config, valid_dataset, split='valid', device=device, num_gpus=args.num_gpus, pretrained_models=pretrained_valid_models)
+    test_cebra_models = train_cebra_per_session(config, test_dataset, split='test', device=device, num_gpus=args.num_gpus, pretrained_models=pretrained_test_models)
 
     # Stage 2: Train HalfUNet decoder
     print("\n" + "="*80)
     print("Stage 2: Training HalfUNet Decoder")
     print("="*80)
     print("All CEBRA embeddings have same dimension - can train single decoder")
+
+    # Handle checkpoint resumption
+    start_epoch = 0
+    checkpoint_dir = args.checkpoint_dir if args.checkpoint_dir else Path(config['output']['save_dir']) / 'checkpoints'
+    checkpoint_dir = Path(checkpoint_dir)
+
+    if args.continue_learning:
+        print("\n🔄 Attempting to resume from checkpoint...")
+        last_checkpoint_path = checkpoint_dir / 'last_model.pt'
+        if last_checkpoint_path.exists():
+            checkpoint = torch.load(last_checkpoint_path)
+            start_epoch = checkpoint['epoch']
+            print(f"  ✅ Found checkpoint at epoch {start_epoch}")
+            print(f"  Will resume training from epoch {start_epoch}")
+        else:
+            print(f"  ⚠️  No checkpoint found at {last_checkpoint_path}")
+            print("  Starting training from scratch")
 
     decoder = train_decoder_only(
         config,
@@ -1091,11 +1412,22 @@ def main():
         train_dataset,
         valid_dataset,
         device=device,
-        wandb_run=wandb_run
+        wandb_run=wandb_run,
+        start_epoch=start_epoch,
+        checkpoint_path=checkpoint_dir
     )
 
     # Visualize results
     visualize_results(
+        decoder,
+        test_cebra_models,
+        test_dataset,
+        config['output']['save_dir'],
+        device=device
+    )
+
+    # Save test predictions and ground truth
+    save_test_results(
         decoder,
         test_cebra_models,
         test_dataset,
@@ -1117,15 +1449,20 @@ def main():
     print("\nResults:")
     print(f"1. CEBRA models (per session) saved to {config['output']['save_dir']}/cebra_models_*/")
     print(f"2. HalfUNet decoder saved to {config['output']['save_dir']}/")
-    print(f"3. Visualizations saved to {config['output']['save_dir']}/")
+    print(f"3. Checkpoints saved to {config['output']['save_dir']}/checkpoints/ (best_model.pt, last_model.pt)")
+    print(f"4. Test results saved to {config['output']['save_dir']}/ (true.pt, pred.pt)")
+    print(f"5. Visualizations saved to {config['output']['save_dir']}/")
     if wandb_run is not None:
-        print(f"4. Training logs available at wandb")
+        print(f"6. Training logs available at wandb")
     print("\nTwo-Stage Training Summary:")
     print(f"  - Stage 1: Trained {len(train_cebra_models)} CEBRA models (one per session)")
     print(f"  - Stage 2: Trained single HalfUNet decoder on all embeddings")
     print("\nTo use the trained models:")
     print("  - Load CEBRA model: cebra.CEBRA.load('path/to/cebra_models_*/train/cebra_SESSION_ID.pt')")
     print("  - Load decoder: decoder.load_state_dict(torch.load('path/to/halfunet_decoder.pt'))")
+    print("  - Load test results: torch.load('path/to/true.pt'), torch.load('path/to/pred.pt')")
+    print("\nTo resume training:")
+    print("  - python run_allen_cebra.py --config allen_config.yaml --continue_learning")
     print()
 
 if __name__ == "__main__":

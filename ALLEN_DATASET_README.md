@@ -55,7 +55,7 @@ python3 simple_allen_test.py
 ### 2. 메인 학습 스크립트 실행
 
 ```bash
-# 기본 설정으로 실행
+# 기본 설정으로 실행 (from scratch)
 python3 run_allen_cebra.py --config allen_config.yaml
 
 # 4개 세션으로 제한
@@ -66,6 +66,72 @@ python3 run_allen_cebra.py --config allen_config.yaml --batch_size 8
 
 # 데이터 디렉토리 변경
 python3 run_allen_cebra.py --config allen_config.yaml --data_dir /path/to/data
+```
+
+### 3. Pretrain/Finetune 워크플로우 🔥
+
+두 단계 학습 방식을 지원합니다:
+
+#### Step 1: Pretrain 모드 (모든 데이터로 CEBRA 학습)
+
+```bash
+# Pretrain: 모든 splits를 합쳐서 CEBRA 학습
+python3 run_allen_cebra.py \
+    --config allen_config.yaml \
+    --pretrain
+
+# Multi-GPU pretrain (4개 GPU 사용)
+python3 run_allen_cebra.py \
+    --config allen_config.yaml \
+    --pretrain \
+    --num_gpus 4
+```
+
+Pretrain 모드에서는:
+- ✅ Train/Valid/Test splits를 모두 합쳐서 사용
+- ✅ Stable/predictable cell types로 필터링
+- ✅ Session별 CEBRA 모델 학습 및 저장
+- 📁 결과: `results/cebra_models_<timestamp>/train/`, `valid/`, `test/`
+
+#### Step 2: Finetune 모드 (pretrained CEBRA 로드 + decoder 학습)
+
+```bash
+# Finetune: pretrained CEBRA 로드하고 decoder만 학습
+python3 run_allen_cebra.py \
+    --config allen_config.yaml \
+    --finetune \
+    --pretrained_cebra_dir results/cebra_models_20231201_120000 \
+    --freeze_cebra
+
+# Finetune + CEBRA도 계속 학습
+python3 run_allen_cebra.py \
+    --config allen_config.yaml \
+    --finetune \
+    --pretrained_cebra_dir results/cebra_models_20231201_120000
+```
+
+Finetune 모드에서는:
+- ✅ Pretrained CEBRA 모델 로드
+- ✅ Specific cell types로 필터링 (ssl_mode 기반)
+- ✅ `--freeze_cebra` 사용 시: CEBRA frozen, decoder만 학습 ❄️
+- ✅ `--freeze_cebra` 미사용 시: CEBRA + decoder 모두 학습 🔥
+
+**워크플로우 예시:**
+
+```bash
+# 1단계: Pretrain with all data
+python3 run_allen_cebra.py --config allen_config.yaml --pretrain --num_gpus 4
+
+# 출력: results/cebra_models_20251028_143000/
+
+# 2단계: Finetune with specific cell types (decoder only)
+python3 run_allen_cebra.py \
+    --config allen_config.yaml \
+    --finetune \
+    --pretrained_cebra_dir results/cebra_models_20251028_143000 \
+    --freeze_cebra
+
+# 출력: results/halfunet_decoder_<timestamp>.pt
 ```
 
 ## ⚙️ 설정 파일 (allen_config.yaml)
