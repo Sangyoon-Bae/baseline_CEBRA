@@ -42,6 +42,9 @@ except ImportError:
     CEBRA_AVAILABLE = False
     print("Warning: CEBRA not available")
 
+# Import CEBRA decoders
+from cebra.integrations.decoders import SingleLayerDecoder, TwoLayersDecoder
+
 # Import wandb
 try:
     import wandb
@@ -123,6 +126,9 @@ def create_kirby_dataset(config, split='train', pretrain=False, finetune=False):
         }]
     }]
 
+    # Get task from config (default to movie_decoding_one for backward compatibility)
+    task = config.get('task', 'movie_decoding_one')
+
     # Create dataset
     dataset = KirbyDataset(
         root=config['dataset']['data_dir'],
@@ -132,7 +138,7 @@ def create_kirby_dataset(config, split='train', pretrain=False, finetune=False):
         pretrain=pretrain,
         finetune=finetune,
         small_model=config.get('small_model', False),
-        task='movie_decoding_one',  # natural movie one
+        task=task,
         ssl_mode=config.get('ssl_mode', 'predictable'),
         model_dim=config['model']['output_dimension']
     )
@@ -450,6 +456,358 @@ def extract_movie_frames(session_data, dataset):
             raise AttributeError(f"natural_movie_one does not have frame_number attribute")
 
     raise AttributeError(f"Cannot extract movie frames. Available attributes: {session_data.keys}")
+
+def extract_drifting_gratings_labels(session_data):
+    """
+    Extract drifting gratings orientation labels from session_data.
+
+    For Allen dataset, orientation is stored in drifting_gratings.orientation,
+    with 8 possible orientations (0, 45, 90, 135, 180, 225, 270, 315 degrees).
+
+    Args:
+        session_data: Data object from dataset
+
+    Returns:
+        torch.Tensor of orientation labels, shape (T,) with values in [0-7]
+    """
+    # Check if drifting_gratings directly exists
+    if hasattr(session_data, 'drifting_gratings'):
+        drifting_gratings = session_data.drifting_gratings
+
+        # Get orientation labels
+        if hasattr(drifting_gratings, 'orientation'):
+            orientation_raw = drifting_gratings.orientation
+
+            # Convert to numpy if needed
+            if hasattr(orientation_raw, 'cpu'):
+                orientation = orientation_raw.cpu().numpy()
+            elif hasattr(orientation_raw, 'numpy'):
+                orientation = orientation_raw.numpy()
+            else:
+                orientation = orientation_raw
+
+            # Convert to integers (should be 0-7)
+            orientation = orientation.squeeze().astype(int)
+
+            # Validate orientation values are in valid range [0, 7]
+            if np.any(orientation < 0) or np.any(orientation > 7):
+                print(f"Warning: Orientation values out of range. Min: {orientation.min()}, Max: {orientation.max()}")
+                orientation = np.clip(orientation, 0, 7)
+
+            return torch.from_numpy(orientation).long()
+        else:
+            raise AttributeError(f"drifting_gratings does not have orientation attribute")
+
+    raise AttributeError(f"Cannot extract drifting gratings labels. Available attributes: {session_data.keys}")
+
+def train_decoder_classification(config, train_cebra_models, valid_cebra_models, train_dataset, valid_dataset, device='cuda', wandb_run=None, start_epoch=0, checkpoint_path=None):
+    """
+    Train CEBRA decoder (SingleLayer or TwoLayers) for classification tasks
+
+    This is for tasks like drifting gratings orientation classification.
+    Uses standard CEBRA decoders instead of HalfUNet.
+
+    Args:
+        config: Configuration dictionary
+        train_cebra_models: Dictionary of session_id -> trained CEBRA model (train)
+        valid_cebra_models: Dictionary of session_id -> trained CEBRA model (valid)
+        train_dataset: Training dataset
+        valid_dataset: Validation dataset
+        device: Device to use for training
+        wandb_run: Weights & Biases run object for logging
+        start_epoch: Starting epoch (for resume training)
+        checkpoint_path: Path to checkpoint directory for saving models
+
+    Returns:
+        Trained CEBRA decoder
+    """
+    print(f"\n{'='*80}")
+    print("Stage 2: Training CEBRA Decoder (Classification)")
+    print(f"{'='*80}")
+    print("Using pre-trained CEBRA embeddings for decoder training")
+
+    # Get decoder configuration
+    decoder_config = config.get('decoder', {})
+    decoder_type = decoder_config.get('type', 'TwoLayersDecoder')
+    output_dim = decoder_config.get('output_dim', 8)  # 8 classes for drifting gratings
+
+    # Initialize decoder
+    input_dim = config['model']['output_dimension']
+    if decoder_type == 'SingleLayerDecoder':
+        decoder = SingleLayerDecoder(input_dim=input_dim, output_dim=output_dim)
+    elif decoder_type == 'TwoLayersDecoder':
+        decoder = TwoLayersDecoder(input_dim=input_dim, output_dim=output_dim)
+    else:
+        raise ValueError(f"Unknown decoder type: {decoder_type}")
+
+    print(f"\nDecoder: {decoder_type}")
+    print(f"  Input dim: {input_dim} (CEBRA embedding)")
+    print(f"  Output dim: {output_dim} (number of classes)")
+
+    # Move to device and enable DataParallel if multiple GPUs available
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print(f"\n🚀 Using DataParallel with {torch.cuda.device_count()} GPUs")
+        decoder = nn.DataParallel(decoder)
+        decoder = decoder.to(device)
+    else:
+        decoder = decoder.to(device)
+
+    # Loss function for classification
+    criterion = nn.CrossEntropyLoss()
+
+    # Optimizer for decoder only (CEBRA is frozen)
+    optimizer = torch.optim.Adam(
+        decoder.parameters(),
+        lr=decoder_config.get('learning_rate', 0.001)
+    )
+
+    print(f"\nDecoder optimizer created")
+    print(f"  CEBRA models: FROZEN (pre-trained)")
+    print(f"  Decoder: TRAINABLE")
+
+    # Training parameters
+    num_epochs = decoder_config.get('num_epochs', 50)
+    batch_size = decoder_config.get('batch_size', 128)
+
+    print(f"Training parameters:")
+    print(f"  Epochs: {num_epochs}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Learning rate: {optimizer.param_groups[0]['lr']}")
+
+    # Setup checkpoint directory
+    if checkpoint_path is None:
+        checkpoint_path = Path(config['output']['save_dir']) / 'checkpoints'
+    else:
+        checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+    print(f"Checkpoint directory: {checkpoint_path}")
+
+    # Load checkpoint if resuming training
+    best_valid_loss = float('inf')
+    best_valid_accuracy = 0.0
+    if start_epoch > 0:
+        last_checkpoint = checkpoint_path / 'last_model.pt'
+        if last_checkpoint.exists():
+            print(f"\n🔄 Loading checkpoint from epoch {start_epoch}")
+            checkpoint = torch.load(last_checkpoint)
+
+            # Load model state
+            if isinstance(decoder, nn.DataParallel):
+                decoder.module.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                decoder.load_state_dict(checkpoint['model_state_dict'])
+
+            # Load optimizer state
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+            # Load best metrics
+            best_valid_loss = checkpoint.get('best_valid_loss', float('inf'))
+            best_valid_accuracy = checkpoint.get('best_valid_accuracy', 0.0)
+
+            print(f"  ✅ Resumed from epoch {start_epoch}")
+            print(f"  Best validation loss: {best_valid_loss:.4f}")
+            print(f"  Best validation accuracy: {best_valid_accuracy:.4f}")
+        else:
+            print(f"\n⚠️  Warning: No checkpoint found at {last_checkpoint}")
+            print("  Starting training from scratch")
+            start_epoch = 0
+
+    # Training loop
+    for epoch in range(start_epoch, num_epochs):
+        decoder.train()
+        train_losses = []
+        train_correct = 0
+        train_total = 0
+
+        # Training phase
+        for session_id in tqdm(train_dataset.session_ids, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            try:
+                # Skip if no CEBRA model for this session
+                if session_id not in train_cebra_models:
+                    continue
+
+                session_data = train_dataset.get_session_data(session_id)
+
+                # Get neural data and labels
+                neural_data = extract_neural_data(session_data)
+                labels = extract_drifting_gratings_labels(session_data)  # Shape: (T,)
+
+                # Validate data shapes
+                if len(neural_data) != len(labels):
+                    print(f"Warning: Length mismatch for session {session_id}. Neural: {len(neural_data)}, Labels: {len(labels)}. Taking minimum.")
+                    min_len = min(len(neural_data), len(labels))
+                    neural_data = neural_data[:min_len]
+                    labels = labels[:min_len]
+
+                # Get pre-trained CEBRA model for this session
+                cebra_model = train_cebra_models[session_id]
+
+                # Generate embeddings (no gradients - CEBRA is frozen)
+                with torch.no_grad():
+                    embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
+
+                # Move labels to device
+                targets = labels.to(device)
+
+                # Mini-batch training
+                num_samples = len(embeddings)
+
+                if num_samples == 0:
+                    print(f"Warning: No samples for session {session_id}. Skipping.")
+                    continue
+
+                indices = torch.randperm(num_samples, device=embeddings.device)
+
+                for i in range(0, num_samples, batch_size):
+                    try:
+                        end_idx = min(i + batch_size, num_samples)
+                        batch_indices = indices[i:end_idx]
+
+                        if len(batch_indices) == 0:
+                            continue
+
+                        batch_embeddings = embeddings[batch_indices]
+                        batch_targets = targets[batch_indices]
+
+                        # Forward pass
+                        predictions = decoder(batch_embeddings)
+
+                        # Compute loss
+                        loss = criterion(predictions, batch_targets)
+
+                        # Check for NaN/Inf
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"Warning: NaN/Inf detected in loss for session {session_id}, batch {i}. Skipping batch.")
+                            continue
+
+                        # Backward pass
+                        optimizer.zero_grad()
+                        loss.backward()
+
+                        # Gradient clipping
+                        torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
+
+                        optimizer.step()
+
+                        # Track losses and accuracy
+                        train_losses.append(loss.item())
+
+                        # Calculate accuracy
+                        _, predicted = torch.max(predictions.data, 1)
+                        train_total += batch_targets.size(0)
+                        train_correct += (predicted == batch_targets).sum().item()
+
+                    except (IndexError, RuntimeError) as e:
+                        print(f"Warning: Error in session {session_id}, batch {i}: {e}")
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        continue
+
+            except Exception as e:
+                print(f"Warning: Error processing session {session_id}: {e}")
+                continue
+
+        avg_train_loss = np.mean(train_losses) if train_losses else float('inf')
+        train_accuracy = 100 * train_correct / train_total if train_total > 0 else 0
+
+        # Validation phase
+        decoder.eval()
+        valid_losses = []
+        valid_correct = 0
+        valid_total = 0
+
+        with torch.no_grad():
+            for session_id in valid_dataset.session_ids:
+                try:
+                    # Skip if no CEBRA model for this session
+                    if session_id not in valid_cebra_models:
+                        continue
+
+                    session_data = valid_dataset.get_session_data(session_id)
+
+                    neural_data = extract_neural_data(session_data)
+                    labels = extract_drifting_gratings_labels(session_data)
+
+                    # Validate data shapes
+                    if len(neural_data) != len(labels):
+                        print(f"Warning: Length mismatch in validation for session {session_id}. Taking minimum.")
+                        min_len = min(len(neural_data), len(labels))
+                        neural_data = neural_data[:min_len]
+                        labels = labels[:min_len]
+
+                    if len(neural_data) == 0:
+                        continue
+
+                    # Get pre-trained CEBRA model for this session
+                    cebra_model = valid_cebra_models[session_id]
+
+                    # Generate embeddings
+                    embeddings = torch.from_numpy(cebra_model.transform(neural_data)).float().to(device)
+                    targets = labels.to(device)
+
+                    # Forward pass
+                    predictions = decoder(embeddings)
+
+                    # Compute loss
+                    loss = criterion(predictions, targets)
+                    valid_losses.append(loss.item())
+
+                    # Calculate accuracy
+                    _, predicted = torch.max(predictions.data, 1)
+                    valid_total += targets.size(0)
+                    valid_correct += (predicted == targets).sum().item()
+
+                except Exception as e:
+                    print(f"Warning: Error in validation session {session_id}: {e}")
+                    continue
+
+        avg_valid_loss = np.mean(valid_losses) if valid_losses else float('inf')
+        valid_accuracy = 100 * valid_correct / valid_total if valid_total > 0 else 0
+
+        # Print summary
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        print(f"  Train Loss: {avg_train_loss:.4f} | Valid Loss: {avg_valid_loss:.4f}")
+        print(f"  Train Accuracy: {train_accuracy:.2f}% | Valid Accuracy: {valid_accuracy:.2f}%")
+
+        # Log to wandb
+        if wandb_run is not None:
+            wandb_run.log({
+                'epoch': epoch + 1,
+                'train/loss': avg_train_loss,
+                'train/accuracy': train_accuracy,
+                'valid/loss': avg_valid_loss,
+                'valid/accuracy': valid_accuracy,
+                'average_val_metric': valid_accuracy,
+            })
+
+        # Prepare checkpoint dictionary
+        model_state = decoder.module.state_dict() if isinstance(decoder, nn.DataParallel) else decoder.state_dict()
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model_state,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'valid_loss': avg_valid_loss,
+            'valid_accuracy': valid_accuracy,
+            'best_valid_loss': best_valid_loss,
+            'best_valid_accuracy': best_valid_accuracy,
+            'config': config
+        }
+
+        # Save last model (every epoch)
+        last_checkpoint_path = checkpoint_path / 'last_model.pt'
+        torch.save(checkpoint, last_checkpoint_path)
+
+        # Save best model (based on accuracy)
+        if valid_accuracy > best_valid_accuracy:
+            best_valid_accuracy = valid_accuracy
+            best_valid_loss = avg_valid_loss
+            best_checkpoint_path = checkpoint_path / 'best_model.pt'
+            torch.save(checkpoint, best_checkpoint_path)
+            print(f"  ✅ New best model saved! (Accuracy: {best_valid_accuracy:.2f}%)")
+
+    print("✅ Decoder training complete!")
+    print(f"Best validation accuracy: {best_valid_accuracy:.2f}%")
+    return decoder
 
 def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dataset, valid_dataset, device='cuda', wandb_run=None, start_epoch=0, checkpoint_path=None):
     """
@@ -1382,9 +1740,15 @@ def main():
     valid_cebra_models = train_cebra_per_session(config, valid_dataset, split='valid', device=device, num_gpus=args.num_gpus, pretrained_models=pretrained_valid_models)
     test_cebra_models = train_cebra_per_session(config, test_dataset, split='test', device=device, num_gpus=args.num_gpus, pretrained_models=pretrained_test_models)
 
-    # Stage 2: Train HalfUNet decoder
+    # Stage 2: Train decoder
+    # Determine which decoder to use based on task
+    task = config.get('task', 'movie_decoding_one')
+
     print("\n" + "="*80)
-    print("Stage 2: Training HalfUNet Decoder")
+    if task == 'drifting_gratings':
+        print("Stage 2: Training CEBRA Decoder (Classification)")
+    else:
+        print("Stage 2: Training HalfUNet Decoder (Reconstruction)")
     print("="*80)
     print("All CEBRA embeddings have same dimension - can train single decoder")
 
@@ -1405,35 +1769,54 @@ def main():
             print(f"  ⚠️  No checkpoint found at {last_checkpoint_path}")
             print("  Starting training from scratch")
 
-    decoder = train_decoder_only(
-        config,
-        train_cebra_models,
-        valid_cebra_models,
-        train_dataset,
-        valid_dataset,
-        device=device,
-        wandb_run=wandb_run,
-        start_epoch=start_epoch,
-        checkpoint_path=checkpoint_dir
-    )
+    # Choose appropriate decoder based on task
+    if task == 'drifting_gratings':
+        decoder = train_decoder_classification(
+            config,
+            train_cebra_models,
+            valid_cebra_models,
+            train_dataset,
+            valid_dataset,
+            device=device,
+            wandb_run=wandb_run,
+            start_epoch=start_epoch,
+            checkpoint_path=checkpoint_dir
+        )
+    else:
+        decoder = train_decoder_only(
+            config,
+            train_cebra_models,
+            valid_cebra_models,
+            train_dataset,
+            valid_dataset,
+            device=device,
+            wandb_run=wandb_run,
+            start_epoch=start_epoch,
+            checkpoint_path=checkpoint_dir
+        )
 
-    # Visualize results
-    visualize_results(
-        decoder,
-        test_cebra_models,
-        test_dataset,
-        config['output']['save_dir'],
-        device=device
-    )
+    # Visualize results (only for reconstruction tasks)
+    if task != 'drifting_gratings':
+        visualize_results(
+            decoder,
+            test_cebra_models,
+            test_dataset,
+            config['output']['save_dir'],
+            device=device
+        )
 
-    # Save test predictions and ground truth
-    save_test_results(
-        decoder,
-        test_cebra_models,
-        test_dataset,
-        config['output']['save_dir'],
-        device=device
-    )
+        # Save test predictions and ground truth
+        save_test_results(
+            decoder,
+            test_cebra_models,
+            test_dataset,
+            config['output']['save_dir'],
+            device=device
+        )
+    else:
+        print("\n" + "="*80)
+        print("Skipping visualization (classification task)")
+        print("="*80)
 
     # Save results
     save_results(train_cebra_models, valid_cebra_models, test_cebra_models, decoder, config)

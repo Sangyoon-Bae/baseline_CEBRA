@@ -1,0 +1,137 @@
+# Drifting Gratings Configuration for CEBRA Pretraining
+# Dataset: Allen Brain Observatory Visual Coding - Calcium Imaging
+# Task: Drifting Gratings Orientation Classification (8 classes)
+
+dataset:
+  name: "allen_brain_observatory_calcium"
+  data_dir: "data"
+  file_pattern: "*.h5"
+
+  # Data splits
+  splits:
+    train: "train_mask"
+    valid: "valid_mask"
+    test: "test_mask"
+
+  # Neural data configuration
+  neural:
+    dataset_key: "calcium_traces/df_over_f"  # (timepoints, neurons)
+    dtype: "float32"
+    normalize: true  # Apply z-score normalization
+
+  # Temporal information
+  temporal:
+    domain_start_key: "calcium_traces/domain/start"
+    domain_end_key: "calcium_traces/domain/end"
+    use_timestamps: true
+
+  # Session configuration
+  sessions:
+    max_sessions: null  # null = use all sessions, or specify number
+    session_ids: null   # null = use all, or list specific session IDs
+
+# CEBRA Model Configuration (poyo-ssl style)
+model:
+  architecture: "offset10-model"
+  output_dimension: 1024  # Hidden/embedding dimension
+  model_architecture: "offset10-model"
+
+  # Self-supervised learning
+  learning_mode: "time_contrastive"  # poyo-ssl style
+  conditional: "time_delta"
+
+  # Training hyperparameters
+  batch_size: 4
+  learning_rate: 0.0003
+  temperature: 1.0
+  max_iterations: 5000
+
+  # Distance metric
+  distance: "cosine"
+
+  # Device
+  device: "cuda_if_available"
+
+  # Logging
+  verbose: true
+
+# DataLoader Configuration
+dataloader:
+  batch_size: 4
+  num_workers: 0
+  shuffle: true
+  drop_last: false
+
+  # For CEBRA's ContinuousDataLoader
+  num_steps: 10
+  time_offset: 10
+
+# Training Configuration
+training:
+  max_epochs: 25
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+
+  # Checkpointing
+  checkpoint:
+    enabled: true
+    save_dir: "checkpoints"
+    save_frequency: 10  # Save every N epochs
+
+  # Validation
+  validation:
+    enabled: true
+    frequency: 5  # Validate every N epochs
+
+# CEBRA Decoder Configuration (replacing HalfUNet)
+# For drifting gratings: 8 orientation classes
+decoder:
+  type: "TwoLayersDecoder"  # Options: "SingleLayerDecoder", "TwoLayersDecoder"
+  output_dim: 8  # 8 orientation classes for drifting gratings
+  learning_rate: 0.001
+  num_epochs: 50
+  batch_size: 128  # Can use larger batch for classification
+
+  # Loss function for classification
+  loss_fn: "cross_entropy"  # For multinomial classification
+
+# Output Configuration
+output:
+  save_dir: "results_drifting_gratings"
+  save_embeddings: true
+  save_model: true
+
+  # Visualization
+  visualize:
+    enabled: true
+    plot_loss: true
+    plot_embeddings: true
+
+# Weights & Biases Configuration
+wandb:
+  enabled: true
+  entity: ""  # Enter your wandb entity here
+  api_key: ""  # Enter your wandb API key here
+  project: "allen-cebra-drifting-gratings"
+  name: null  # Run name (null = auto-generated)
+  notes: "Pretraining with drifting gratings orientation classification"
+  tags: ["drifting_gratings", "pretraining", "classification"]
+
+# Reproducibility
+seed: 42
+deterministic: true
+
+# Training mode flags
+pretrain: true  # Use pretrain mode to combine all splits
+finetune: false
+
+# Small model flag for testing
+small_model: false
+
+# SSL mode for cell type selection
+ssl_mode: "predictable"  # Options: predictable, inhibitory, unpredictable, mixed
+
+# Task configuration
+task: "drifting_gratings"  # Use drifting gratings instead of movie decoding
