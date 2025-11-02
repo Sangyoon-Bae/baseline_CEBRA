@@ -186,6 +186,8 @@ def load_pretrained_cebra_models(pretrained_dir, split='train'):
     for model_path in tqdm(model_files, desc=f"Loading CEBRA models ({split})"):
         # Extract session_id from filename (e.g., cebra_session123.pt -> session123)
         session_id = model_path.stem.replace("cebra_", "")
+        # Restore original session_id format (e.g., allen_brain_observatory_calcium_657776356 -> allen_brain_observatory_calcium/657776356)
+        session_id = session_id.replace("allen_brain_observatory_calcium_", "allen_brain_observatory_calcium/")
 
         try:
             # Load CEBRA model
@@ -1557,7 +1559,9 @@ def save_results(train_cebra_models, valid_cebra_models, test_cebra_models, deco
         split_dir = cebra_dir / split_name
         split_dir.mkdir(exist_ok=True)
         for session_id, cebra_model in models_dict.items():
-            cebra_path = split_dir / f"cebra_{session_id}.pt"
+            # Replace '/' with '_' in session_id to avoid directory creation issues
+            safe_session_id = session_id.replace('/', '_')
+            cebra_path = split_dir / f"cebra_{safe_session_id}.pt"
             cebra_model.save(str(cebra_path))
         print(f"   ✅ Saved {len(models_dict)} CEBRA models ({split_name}) to {split_dir}")
 
