@@ -1,0 +1,143 @@
+# Fine-tuning Configuration for CEBRA + HalfUNet Decoder
+# Pretrained CEBRA Encoder: /scratch/x3120a05/baseline_CEBRA/results_drifting_gratings
+# Task: Movie Frame Reconstruction with UNet Decoder
+
+dataset:
+  name: "allen_brain_observatory_calcium"
+  data_dir: "data"
+  file_pattern: "*.h5"
+
+  # Data splits
+  splits:
+    train: "train_mask"
+    valid: "valid_mask"
+    test: "test_mask"
+
+  # Neural data configuration
+  neural:
+    dataset_key: "calcium_traces/df_over_f"  # (timepoints, neurons)
+    dtype: "float32"
+    normalize: true  # Apply z-score normalization
+
+  # Temporal information
+  temporal:
+    domain_start_key: "calcium_traces/domain/start"
+    domain_end_key: "calcium_traces/domain/end"
+    use_timestamps: true
+
+  # Session configuration
+  sessions:
+    max_sessions: null  # null = use all sessions, or specify number
+    session_ids: null   # null = use all, or list specific session IDs
+
+# CEBRA Model Configuration (will be loaded from pretrained)
+# These settings MUST match the pretrained model
+model:
+  architecture: "offset10-model"
+  output_dimension: 1024  # Must match pretrained CEBRA embedding dimension
+  model_architecture: "offset10-model"
+
+  # Self-supervised learning (same as pretraining)
+  learning_mode: "time_contrastive"
+  conditional: "time_delta"
+
+  # Training hyperparameters (used only if not freezing CEBRA)
+  batch_size: 4
+  learning_rate: 0.0003
+  temperature: 1.0
+  max_iterations: 5000
+
+  # Distance metric
+  distance: "cosine"
+
+  # Device
+  device: "cuda_if_available"
+
+  # Logging
+  verbose: true
+
+# DataLoader Configuration
+dataloader:
+  batch_size: 4
+  num_workers: 0
+  shuffle: true
+  drop_last: false
+
+  # For CEBRA's ContinuousDataLoader
+  num_steps: 10
+  time_offset: 10
+
+# Training Configuration
+training:
+  max_epochs: 25
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+
+  # Checkpointing
+  checkpoint:
+    enabled: true
+    save_dir: "checkpoints"
+    save_frequency: 10  # Save every N epochs
+
+  # Validation
+  validation:
+    enabled: true
+    frequency: 5  # Validate every N epochs
+
+# HalfUNet Decoder Configuration
+# CEBRA will be FROZEN, only decoder will be trained
+decoder:
+  # latent_dim is automatically set to match CEBRA output_dimension (1024)
+  learning_rate: 0.0001  # Conservative LR for fine-tuning
+  num_epochs: 50  # Fine-tuning epochs
+  batch_size: 32
+
+  # Loss weights (6 losses for comprehensive image reconstruction)
+  loss_weights:
+    l1: 1.0           # L1 Loss - robust pixel-level reconstruction
+    ssim: 0.3         # SSIM Loss - structural similarity
+    perceptual: 0.00003  # Perceptual Loss (AlexNet) - high-level semantic features
+    gradient: 0.05    # Gradient Difference Loss - edge preservation
+    focal: 0.05       # Focal Loss - focus on hard examples
+    fft: 0.1          # FFT Loss - frequency domain matching
+
+# Output Configuration
+output:
+  save_dir: "results_finetune"
+  save_embeddings: true
+  save_model: true
+
+  # Visualization
+  visualize:
+    enabled: true
+    plot_loss: true
+    plot_embeddings: true
+
+# Weights & Biases Configuration
+wandb:
+  enabled: true
+  entity: ""  # Enter your wandb entity here
+  api_key: ""  # Enter your wandb API key here
+  project: "allen-cebra-finetune"
+  name: null  # Run name (null = auto-generated)
+  notes: "Fine-tuning with frozen CEBRA encoder + HalfUNet decoder"
+  tags: ["finetune", "movie_decoding", "halfunet", "frozen_encoder"]
+
+# Reproducibility
+seed: 42
+deterministic: true
+
+# Training mode flags
+pretrain: false  # Not pretraining
+finetune: true   # Fine-tuning mode
+
+# Small model flag for testing
+small_model: false
+
+# SSL mode for cell type selection
+ssl_mode: "predictable"  # Options: predictable, inhibitory, unpredictable, mixed
+
+# Task configuration
+task: "movie_decoding_one"  # Use HalfUNet decoder for movie frame reconstruction
