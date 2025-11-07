@@ -591,7 +591,7 @@ def train_decoder_classification(config, train_cebra_models, valid_cebra_models,
         last_checkpoint = checkpoint_path / 'last_model.pt'
         if last_checkpoint.exists():
             print(f"\n🔄 Loading checkpoint from epoch {start_epoch}")
-            checkpoint = torch.load(last_checkpoint)
+            checkpoint = torch.load(last_checkpoint, weights_only=False)
 
             # Load model state
             if isinstance(decoder, nn.DataParallel):
@@ -913,7 +913,7 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
         last_checkpoint = checkpoint_path / 'last_model.pt'
         if last_checkpoint.exists():
             print(f"\n🔄 Loading checkpoint from epoch {start_epoch}")
-            checkpoint = torch.load(last_checkpoint)
+            checkpoint = torch.load(last_checkpoint, weights_only=False)
 
             # Load model state
             if isinstance(decoder, nn.DataParallel):
@@ -1765,7 +1765,7 @@ def main():
         print("\n🔄 Attempting to resume from checkpoint...")
         last_checkpoint_path = checkpoint_dir / 'last_model.pt'
         if last_checkpoint_path.exists():
-            checkpoint = torch.load(last_checkpoint_path)
+            checkpoint = torch.load(last_checkpoint_path, weights_only=False)
             start_epoch = checkpoint['epoch']
             print(f"  ✅ Found checkpoint at epoch {start_epoch}")
             print(f"  Will resume training from epoch {start_epoch}")
