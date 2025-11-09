@@ -4,8 +4,14 @@ Main script to train CEBRA on Allen Brain Observatory data
 and decode natural movie frames using HalfUNet
 
 Usage:
+    # Training mode
     python run_allen_cebra.py --config allen_config.yaml
     python run_allen_cebra.py --config allen_config.yaml --data_dir /path/to/data
+
+    # Test only mode (load pretrained models and evaluate)
+    python run_allen_cebra.py --config allen_config.yaml --test_only \
+        --pretrained_cebra_dir results/cebra_models_20231201_120000 \
+        --decoder_checkpoint checkpoints/best_model.pt
 """
 
 import argparse
@@ -1660,6 +1666,17 @@ def main():
         default=None,
         help='Directory containing checkpoints (default: output_dir/checkpoints)'
     )
+    parser.add_argument(
+        '--test_only',
+        action='store_true',
+        help='Test only mode: load pretrained models and evaluate on test set (requires --pretrained_cebra_dir and --decoder_checkpoint)'
+    )
+    parser.add_argument(
+        '--decoder_checkpoint',
+        type=str,
+        default=None,
+        help='Path to decoder checkpoint file (e.g., checkpoints/best_model.pt) for test_only mode'
+    )
 
     args = parser.parse_args()
 
@@ -1682,6 +1699,15 @@ def main():
     # Validate pretrain/finetune combination
     if pretrain and finetune:
         raise ValueError("Cannot use both --pretrain and --finetune at the same time")
+
+    # Validate test_only mode requirements
+    if args.test_only:
+        if args.pretrained_cebra_dir is None:
+            raise ValueError("--test_only requires --pretrained_cebra_dir to load pretrained CEBRA models")
+        if args.decoder_checkpoint is None:
+            raise ValueError("--test_only requires --decoder_checkpoint to load trained decoder")
+        print("\n🧪 Mode: TEST ONLY")
+        print("   Will load pretrained models and evaluate on test set only")
 
     # Print training mode
     if pretrain:
@@ -1707,97 +1733,166 @@ def main():
     wandb_run = init_wandb(config)
 
     # Create datasets using Kirby
-    train_dataset = create_kirby_dataset(config, split='train', pretrain=pretrain, finetune=finetune)
-    valid_dataset = create_kirby_dataset(config, split='valid', pretrain=pretrain, finetune=finetune)
-    test_dataset = create_kirby_dataset(config, split='test', pretrain=pretrain, finetune=finetune)
+    # In test_only mode, only create test dataset
+    if args.test_only:
+        train_dataset = None
+        valid_dataset = None
+        test_dataset = create_kirby_dataset(config, split='test', pretrain=pretrain, finetune=finetune)
+    else:
+        train_dataset = create_kirby_dataset(config, split='train', pretrain=pretrain, finetune=finetune)
+        valid_dataset = create_kirby_dataset(config, split='valid', pretrain=pretrain, finetune=finetune)
+        test_dataset = create_kirby_dataset(config, split='test', pretrain=pretrain, finetune=finetune)
 
     # Stage 1: Train or Load CEBRA per session
-    print("\n" + "="*80)
-    print("Stage 1: Training/Loading CEBRA Models Per Session")
-    print("="*80)
-    print("Each session has different neuron counts - training separate CEBRA models")
+    if args.test_only:
+        print("\n" + "="*80)
+        print("Stage 1: Loading Pretrained CEBRA Models (Test Only)")
+        print("="*80)
 
-    # Load pretrained CEBRA models if provided
-    pretrained_train_models = None
-    pretrained_valid_models = None
-    pretrained_test_models = None
+        # Load only test CEBRA models in test_only mode
+        test_cebra_models = load_pretrained_cebra_models(args.pretrained_cebra_dir, split='test')
+        train_cebra_models = None
+        valid_cebra_models = None
+    else:
+        print("\n" + "="*80)
+        print("Stage 1: Training/Loading CEBRA Models Per Session")
+        print("="*80)
+        print("Each session has different neuron counts - training separate CEBRA models")
 
-    if args.pretrained_cebra_dir is not None:
-        print(f"\n🔄 Loading pretrained CEBRA models from: {args.pretrained_cebra_dir}")
-        try:
-            pretrained_train_models = load_pretrained_cebra_models(args.pretrained_cebra_dir, split='train')
-            pretrained_valid_models = load_pretrained_cebra_models(args.pretrained_cebra_dir, split='valid')
-            pretrained_test_models = load_pretrained_cebra_models(args.pretrained_cebra_dir, split='test')
+        # Load pretrained CEBRA models if provided
+        pretrained_train_models = None
+        pretrained_valid_models = None
+        pretrained_test_models = None
 
-            if args.freeze_cebra:
-                print("\n❄️  CEBRA models will be FROZEN (only decoder will be trained)")
-            else:
-                print("\n🔥 CEBRA models will continue training (fine-tuning)")
-        except Exception as e:
-            print(f"\n⚠️  Error loading pretrained models: {e}")
-            print("   Will train from scratch instead")
-            pretrained_train_models = None
-            pretrained_valid_models = None
-            pretrained_test_models = None
+        if args.pretrained_cebra_dir is not None:
+            print(f"\n🔄 Loading pretrained CEBRA models from: {args.pretrained_cebra_dir}")
+            try:
+                pretrained_train_models = load_pretrained_cebra_models(args.pretrained_cebra_dir, split='train')
+                pretrained_valid_models = load_pretrained_cebra_models(args.pretrained_cebra_dir, split='valid')
+                pretrained_test_models = load_pretrained_cebra_models(args.pretrained_cebra_dir, split='test')
 
-    train_cebra_models = train_cebra_per_session(config, train_dataset, split='train', device=device, num_gpus=args.num_gpus, pretrained_models=pretrained_train_models)
-    valid_cebra_models = train_cebra_per_session(config, valid_dataset, split='valid', device=device, num_gpus=args.num_gpus, pretrained_models=pretrained_valid_models)
-    test_cebra_models = train_cebra_per_session(config, test_dataset, split='test', device=device, num_gpus=args.num_gpus, pretrained_models=pretrained_test_models)
+                if args.freeze_cebra:
+                    print("\n❄️  CEBRA models will be FROZEN (only decoder will be trained)")
+                else:
+                    print("\n🔥 CEBRA models will continue training (fine-tuning)")
+            except Exception as e:
+                print(f"\n⚠️  Error loading pretrained models: {e}")
+                print("   Will train from scratch instead")
+                pretrained_train_models = None
+                pretrained_valid_models = None
+                pretrained_test_models = None
 
-    # Stage 2: Train decoder
+        train_cebra_models = train_cebra_per_session(config, train_dataset, split='train', device=device, num_gpus=args.num_gpus, pretrained_models=pretrained_train_models)
+        valid_cebra_models = train_cebra_per_session(config, valid_dataset, split='valid', device=device, num_gpus=args.num_gpus, pretrained_models=pretrained_valid_models)
+        test_cebra_models = train_cebra_per_session(config, test_dataset, split='test', device=device, num_gpus=args.num_gpus, pretrained_models=pretrained_test_models)
+
+    # Stage 2: Train or Load decoder
     # Determine which decoder to use based on task
     task = config.get('task', 'movie_decoding_one')
 
-    print("\n" + "="*80)
-    if task == 'drifting_gratings':
-        print("Stage 2: Training CEBRA Decoder (Classification)")
-    else:
-        print("Stage 2: Training HalfUNet Decoder (Reconstruction)")
-    print("="*80)
-    print("All CEBRA embeddings have same dimension - can train single decoder")
-
-    # Handle checkpoint resumption
-    start_epoch = 0
-    checkpoint_dir = args.checkpoint_dir if args.checkpoint_dir else Path(config['output']['save_dir']) / 'checkpoints'
-    checkpoint_dir = Path(checkpoint_dir)
-
-    if args.continue_learning:
-        print("\n🔄 Attempting to resume from checkpoint...")
-        last_checkpoint_path = checkpoint_dir / 'last_model.pt'
-        if last_checkpoint_path.exists():
-            checkpoint = torch.load(last_checkpoint_path, weights_only=False)
-            start_epoch = checkpoint['epoch']
-            print(f"  ✅ Found checkpoint at epoch {start_epoch}")
-            print(f"  Will resume training from epoch {start_epoch}")
+    if args.test_only:
+        # Test only mode: load pretrained decoder
+        print("\n" + "="*80)
+        if task == 'drifting_gratings':
+            print("Stage 2: Loading Pretrained CEBRA Decoder (Classification)")
         else:
-            print(f"  ⚠️  No checkpoint found at {last_checkpoint_path}")
-            print("  Starting training from scratch")
+            print("Stage 2: Loading Pretrained HalfUNet Decoder (Reconstruction)")
+        print("="*80)
 
-    # Choose appropriate decoder based on task
-    if task == 'drifting_gratings':
-        decoder = train_decoder_classification(
-            config,
-            train_cebra_models,
-            valid_cebra_models,
-            train_dataset,
-            valid_dataset,
-            device=device,
-            wandb_run=wandb_run,
-            start_epoch=start_epoch,
-            checkpoint_path=checkpoint_dir
-        )
+        # Load checkpoint
+        checkpoint_path = Path(args.decoder_checkpoint)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Decoder checkpoint not found: {checkpoint_path}")
+
+        print(f"Loading decoder from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=device)
+
+        # Initialize decoder architecture based on task
+        if task == 'drifting_gratings':
+            decoder_config = config.get('decoder', {})
+            decoder_type = decoder_config.get('type', 'TwoLayersDecoder')
+            output_dim = decoder_config.get('output_dim', 8)
+            input_dim = config['model']['output_dimension']
+
+            if decoder_type == 'SingleLayerDecoder':
+                decoder = SingleLayerDecoder(input_dim=input_dim, output_dim=output_dim)
+            elif decoder_type == 'TwoLayersDecoder':
+                decoder = TwoLayersDecoder(input_dim=input_dim, output_dim=output_dim)
+            else:
+                raise ValueError(f"Unknown decoder type: {decoder_type}")
+        else:
+            # HalfUNet decoder
+            decoder = HalfUNet(
+                in_channels=1,
+                out_channels=1,
+                latent_dim=config['model']['output_dimension']
+            )
+
+        # Load state dict
+        decoder.load_state_dict(checkpoint['model_state_dict'])
+        decoder = decoder.to(device)
+        decoder.eval()
+
+        print(f"✅ Loaded decoder from checkpoint")
+        print(f"   Epoch: {checkpoint.get('epoch', 'N/A')}")
+        print(f"   Validation loss: {checkpoint.get('valid_loss', 'N/A')}")
+        if task == 'drifting_gratings':
+            print(f"   Validation accuracy: {checkpoint.get('valid_accuracy', 'N/A')}")
+        else:
+            print(f"   Validation SSIM: {checkpoint.get('valid_ssim', 'N/A')}")
+
     else:
-        decoder = train_decoder_only(
-            config,
-            train_cebra_models,
-            valid_cebra_models,
-            train_dataset,
-            valid_dataset,
-            device=device,
-            wandb_run=wandb_run,
-            start_epoch=start_epoch,
-            checkpoint_path=checkpoint_dir
-        )
+        # Training mode
+        print("\n" + "="*80)
+        if task == 'drifting_gratings':
+            print("Stage 2: Training CEBRA Decoder (Classification)")
+        else:
+            print("Stage 2: Training HalfUNet Decoder (Reconstruction)")
+        print("="*80)
+        print("All CEBRA embeddings have same dimension - can train single decoder")
+
+        # Handle checkpoint resumption
+        start_epoch = 0
+        checkpoint_dir = args.checkpoint_dir if args.checkpoint_dir else Path(config['output']['save_dir']) / 'checkpoints'
+        checkpoint_dir = Path(checkpoint_dir)
+
+        if args.continue_learning:
+            print("\n🔄 Attempting to resume from checkpoint...")
+            last_checkpoint_path = checkpoint_dir / 'last_model.pt'
+            if last_checkpoint_path.exists():
+                checkpoint = torch.load(last_checkpoint_path, weights_only=False)
+                start_epoch = checkpoint['epoch']
+                print(f"  ✅ Found checkpoint at epoch {start_epoch}")
+                print(f"  Will resume training from epoch {start_epoch}")
+            else:
+                print(f"  ⚠️  No checkpoint found at {last_checkpoint_path}")
+                print("  Starting training from scratch")
+
+        # Choose appropriate decoder based on task
+        if task == 'drifting_gratings':
+            decoder = train_decoder_classification(
+                config,
+                train_cebra_models,
+                valid_cebra_models,
+                train_dataset,
+                valid_dataset,
+                device=device,
+                wandb_run=wandb_run,
+                start_epoch=start_epoch,
+                checkpoint_path=checkpoint_dir
+            )
+        else:
+            decoder = train_decoder_only(
+                config,
+                train_cebra_models,
+                valid_cebra_models,
+                train_dataset,
+                valid_dataset,
+                device=device,
+                wandb_run=wandb_run,
+                start_epoch=start_epoch,
+                checkpoint_path=checkpoint_dir
+            )
 
     # Visualize results (only for reconstruction tasks)
     if task != 'drifting_gratings':
@@ -1822,8 +1917,13 @@ def main():
         print("Skipping visualization (classification task)")
         print("="*80)
 
-    # Save results
-    save_results(train_cebra_models, valid_cebra_models, test_cebra_models, decoder, config)
+    # Save results (skip in test_only mode)
+    if not args.test_only:
+        save_results(train_cebra_models, valid_cebra_models, test_cebra_models, decoder, config)
+    else:
+        print("\n" + "="*80)
+        print("Skipping model saving (test_only mode)")
+        print("="*80)
 
     # Finish wandb run
     if wandb_run is not None:
@@ -1850,6 +1950,10 @@ def main():
     print("  - Load test results: torch.load('path/to/true.pt'), torch.load('path/to/pred.pt')")
     print("\nTo resume training:")
     print("  - python run_allen_cebra.py --config allen_config.yaml --continue_learning")
+    print("\nTo test only (load pretrained models and evaluate):")
+    print("  - python run_allen_cebra.py --config allen_config.yaml --test_only \\")
+    print("      --pretrained_cebra_dir results/cebra_models_YYYYMMDD_HHMMSS \\")
+    print("      --decoder_checkpoint checkpoints/best_model.pt")
     print()
 
 if __name__ == "__main__":
