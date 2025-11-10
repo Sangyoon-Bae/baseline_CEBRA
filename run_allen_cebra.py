@@ -1400,7 +1400,12 @@ def visualize_results(decoder, test_cebra_models, test_dataset, output_dir, devi
             axes[i, 0].axis('off')
 
             # Reconstructed frame
-            axes[i, 1].imshow(predictions[idx, 0].numpy(), cmap='gray')
+            pred_frame = predictions[idx].numpy()
+            # If prediction is 1D (e.g., 256), reshape to 2D (e.g., 16x16)
+            if pred_frame.ndim == 1:
+                frame_size = int(np.sqrt(len(pred_frame)))
+                pred_frame = pred_frame.reshape(frame_size, frame_size)
+            axes[i, 1].imshow(pred_frame, cmap='gray')
             axes[i, 1].set_title(f'Reconstructed Frame {idx}')
             axes[i, 1].axis('off')
 
