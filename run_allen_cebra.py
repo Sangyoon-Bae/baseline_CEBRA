@@ -596,7 +596,7 @@ def train_decoder_classification(config, train_cebra_models, valid_cebra_models,
     if start_epoch > 0:
         last_checkpoint = checkpoint_path / 'last_model.pt'
         if last_checkpoint.exists():
-            print(f"\n🔄 Loading checkpoint from epoch {start_epoch}")
+            print(f"\n🔄 Loading checkpoint to resume from epoch {start_epoch+1}/{num_epochs}")
             checkpoint = torch.load(last_checkpoint, weights_only=False)
 
             # Load model state
@@ -612,7 +612,7 @@ def train_decoder_classification(config, train_cebra_models, valid_cebra_models,
             best_valid_loss = checkpoint.get('best_valid_loss', float('inf'))
             best_valid_accuracy = checkpoint.get('best_valid_accuracy', 0.0)
 
-            print(f"  ✅ Resumed from epoch {start_epoch}")
+            print(f"  ✅ Checkpoint loaded successfully")
             print(f"  Best validation loss: {best_valid_loss:.4f}")
             print(f"  Best validation accuracy: {best_valid_accuracy:.4f}")
         else:
@@ -918,7 +918,7 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
     if start_epoch > 0:
         last_checkpoint = checkpoint_path / 'last_model.pt'
         if last_checkpoint.exists():
-            print(f"\n🔄 Loading checkpoint from epoch {start_epoch}")
+            print(f"\n🔄 Loading checkpoint to resume from epoch {start_epoch+1}/{num_epochs}")
             checkpoint = torch.load(last_checkpoint, weights_only=False)
 
             # Load model state
@@ -934,7 +934,7 @@ def train_decoder_only(config, train_cebra_models, valid_cebra_models, train_dat
             best_valid_loss = checkpoint.get('best_valid_loss', float('inf'))
             best_valid_ssim = checkpoint.get('best_valid_ssim', 0.0)
 
-            print(f"  ✅ Resumed from epoch {start_epoch}")
+            print(f"  ✅ Checkpoint loaded successfully")
             print(f"  Best validation loss: {best_valid_loss:.4f}")
             print(f"  Best validation SSIM: {best_valid_ssim:.4f}")
         else:
@@ -1866,9 +1866,10 @@ def main():
             last_checkpoint_path = checkpoint_dir / 'last_model.pt'
             if last_checkpoint_path.exists():
                 checkpoint = torch.load(last_checkpoint_path, weights_only=False)
-                start_epoch = checkpoint['epoch']
-                print(f"  ✅ Found checkpoint at epoch {start_epoch}")
-                print(f"  Will resume training from epoch {start_epoch}")
+                completed_epoch = checkpoint['epoch']
+                start_epoch = completed_epoch + 1  # Start from next epoch
+                print(f"  ✅ Found checkpoint - last completed epoch: {completed_epoch+1}/{config['training']['max_epochs']}")
+                print(f"  Will resume training from epoch {start_epoch+1}/{config['training']['max_epochs']}")
             else:
                 print(f"  ⚠️  No checkpoint found at {last_checkpoint_path}")
                 print("  Starting training from scratch")

@@ -701,12 +701,12 @@ class MiddleUNetDecoderOnly(nn.Module):
             nn.BatchNorm2d(feat_ch),
             nn.LeakyReLU(0.2, inplace=True),
 
-            nn.Upsample(size=(100, 100), mode='bilinear', align_corners=False),  # 64→80
+            nn.Upsample(size=(128, 128), mode='bilinear', align_corners=False),  # 64→128
             nn.Conv2d(feat_ch, feat_ch, kernel_size=3, padding=1),
             nn.BatchNorm2d(feat_ch),
             nn.LeakyReLU(0.2, inplace=True),
 
-            nn.Upsample(scale_factor=(1, 2), mode='bilinear', align_corners=False),  # 100x100 → 100x200 (가로만 2배)
+            nn.Upsample(size=(128, 256), mode='bilinear', align_corners=False),  # 128x128 → 128x256 (Allen movie size)
             nn.Conv2d(feat_ch, out_channels, kernel_size=3, padding=1),  # 마지막에만 out_channels로 투사
         )
         
@@ -794,7 +794,7 @@ class UNetDecoderOnly(nn.Module):
             nn.Conv2d(feat_ch, feat_ch, kernel_size=3, padding=1),
             nn.BatchNorm2d(feat_ch),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Upsample(size=(64, 128), mode='bilinear', align_corners=False),  # 64→64x128
+            nn.Upsample(size=(128, 256), mode='bilinear', align_corners=False),  # 64→128x256 (Allen movie size)
             nn.Conv2d(feat_ch, out_channels, kernel_size=3, padding=1),        # 최종 투사만 out_channels
         )
         
